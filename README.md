@@ -23,6 +23,9 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 - **Cloudflare proxy** - Enabled by default (orange cloud), optional `--no-proxy` flag
 - **Resumable operations** - If setup fails midway, just run again to continue
 - **Safe removal** - Cleans up DNS, SSL, and Apache but preserves your files
+- **Preview mode** - Use `--dry-run` to see what changes would be made without executing them
+- **Security hardened** - Safe config parsing, domain validation, and concurrency protection
+- **Concurrent execution protection** - Lock files prevent multiple operations on the same domain
 
 ## Requirements
 
@@ -105,6 +108,9 @@ sudo sitectl add api.example.com --skip-ssl
 
 # Custom DNS propagation wait time
 sudo sitectl add api.example.com --wait 300
+
+# Preview changes without executing (dry run)
+sudo sitectl add example.com --dry-run
 ```
 
 ### `sitectl remove <domain>`
