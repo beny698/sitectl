@@ -391,6 +391,19 @@ clone_git_repo() {
     local slug="$3"
     local username="site_${slug}"
     
+    # Check if git is installed
+    if ! command_exists git; then
+        error "Git is not installed. Please install it first: sudo apt-get install git"
+        return 1
+    fi
+    
+    # Check if deploy key exists
+    if [[ ! -f /root/.ssh/github_account ]]; then
+        error "SSH deploy key not found at /root/.ssh/github_account"
+        error "Generate one with: ssh-keygen -t ed25519 -f /root/.ssh/github_account"
+        return 1
+    fi
+    
     info "Cloning repository: ${repo_url}"
     
     # Ensure GitHub host key is trusted
@@ -859,6 +872,16 @@ cmd_add() {
         echo "  • Apache HTTP config: /etc/apache2/sites-available/${domain}.conf"
         [[ "$skip_ssl" == "false" ]] && echo "  • Apache HTTPS config: /etc/apache2/sites-available/${domain}-ssl.conf"
         echo ""
+        echo "Git Integration:"
+        if [[ "$with_git" == "true" ]]; then
+            echo "  • Would prompt for GitHub repository URL and slug"
+            echo "  • Would create Linux user: site_<slug>"
+            echo "  • Would clone repository to ${docroot}"
+            echo "  • Would update /usr/local/bin/site-pull"
+        else
+            echo "  • Git integration skipped (--without-git)"
+        fi
+        echo ""
         echo "SSL Certificate:"
         if [[ "$skip_ssl" == "false" ]]; then
             echo "  • Would request certificate for: ${domain}$([[ "$is_sub" == "false" ]] && echo ", www.${domain}")"
@@ -1131,7 +1154,7 @@ HTML
 }
 
 cmd_add_git() {
-    local domain="$1"
+    local domain="${1:-}"
     
     if [[ -z "$domain" ]]; then
         fatal "Usage: sitectl add-git <domain>"
@@ -1255,7 +1278,7 @@ cmd_add_git() {
 }
 
 cmd_remove() {
-    local domain="$1"
+    local domain="${1:-}"
     
     if [[ -z "$domain" ]]; then
         fatal "Usage: sitectl remove <domain>"
@@ -1406,7 +1429,7 @@ cmd_list() {
 }
 
 cmd_status() {
-    local domain="$1"
+    local domain="${1:-}"
     
     if [[ -z "$domain" ]]; then
         fatal "Usage: sitectl status <domain>"
