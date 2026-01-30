@@ -36,7 +36,7 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 
 ```bash
 # Download the script
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/sitectl/main/sitectl
+curl -O https://raw.githubusercontent.com/beny698/sitectl/main/sitectl
 
 # Run the installer (installs dependencies, creates config)
 sudo bash sitectl install

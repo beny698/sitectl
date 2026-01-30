@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck shell=bash
 # ============================================================
 # sitectl - Apache Virtual Host Manager with Cloudflare DNS & Let's Encrypt SSL
 # 
@@ -71,7 +72,7 @@ confirm() {
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
-need() {
+command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
@@ -1049,11 +1050,11 @@ cmd_install() {
     info "Checking dependencies..."
     local packages_needed=()
     
-    need apache2ctl || packages_needed+=(apache2)
-    need certbot || packages_needed+=(certbot)
+    command_exists apache2ctl || packages_needed+=(apache2)
+    command_exists certbot || packages_needed+=(certbot)
     python3 -c "import certbot_dns_cloudflare" >/dev/null 2>&1 || packages_needed+=(python3-certbot-dns-cloudflare)
-    need curl || packages_needed+=(curl)
-    need jq || packages_needed+=(jq)
+    command_exists curl || packages_needed+=(curl)
+    command_exists jq || packages_needed+=(jq)
     
     if [[ ${#packages_needed[@]} -gt 0 ]]; then
         info "Installing: ${packages_needed[*]}"
