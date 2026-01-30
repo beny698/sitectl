@@ -119,7 +119,7 @@ load_config() {
             SERVER_IPV4) SERVER_IPV4="$value" ;;
             SERVER_IPV6) SERVER_IPV6="$value" ;;
         esac
-    done < <(grep -v '^\s*#' "$CONFIG_FILE" | grep '=')
+    done < <(grep -vE '^[[:space:]]*#' "$CONFIG_FILE" | grep '=')
     
     # Validate required config
     if [[ -z "${CF_TOKEN:-}" || "$CF_TOKEN" == "YOUR_CLOUDFLARE_API_TOKEN_HERE" ]]; then
