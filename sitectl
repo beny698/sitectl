@@ -129,7 +129,7 @@ load_config() {
     
     # Validate DNS_WAIT_SECONDS is a positive integer if set
     if [[ -n "${DNS_WAIT_SECONDS:-}" ]]; then
-        if ! [[ "$DNS_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+        if ! [[ "$DNS_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
             fatal "DNS_WAIT_SECONDS must be a positive integer in $CONFIG_FILE"
         fi
     fi
