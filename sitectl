@@ -1378,6 +1378,8 @@ HELP
     echo ""
     echo "    Optional settings:"
     echo "      DNS_WAIT_SECONDS How long to wait for DNS propagation (default: 180)"
+    echo "      SERVER_IPV4      Server IPv4 address (auto-detected if not set)"
+    echo "      SERVER_IPV6      Server IPv6 address (auto-detected if not set)"
     echo ""
     echo "    To edit:"
     echo "      sudo nano /etc/sitectl/config"
