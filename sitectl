@@ -356,7 +356,12 @@ create_site_user() {
     info "Creating Linux user: ${username}"
     
     # Create user with home directory at docroot, no login shell
-    useradd -r -m -d "$docroot" -s /usr/sbin/nologin -c "Site user for ${slug}" "$username" || {
+    local useradd_args=(-r -d "$docroot" -s /usr/sbin/nologin -c "Site user for ${slug}")
+    # Only request home directory creation if it does not already exist
+    if [[ ! -d "$docroot" ]]; then
+        useradd_args+=(-m)
+    fi
+    useradd "${useradd_args[@]}" "$username" || {
         error "Failed to create user ${username}"
         return 1
     }
