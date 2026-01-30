@@ -1,0 +1,1311 @@
+#!/usr/bin/env bash
+# ============================================================
+# sitectl - Apache Virtual Host Manager with Cloudflare DNS & Let's Encrypt SSL
+# 
+# A CLI tool for managing LAMP server sites with automatic:
+#   - Cloudflare DNS (A + AAAA records, proxy enabled by default)
+#   - Apache virtual host configuration
+#   - Let's Encrypt SSL via DNS-01 challenge
+#
+# Usage: sudo sitectl <command> [options]
+# Run 'sitectl help' for full documentation.
+# ============================================================
+
+set -euo pipefail
+
+VERSION="1.0.0"
+CONFIG_FILE="/etc/sitectl/config"
+STATE_DIR="/etc/sitectl/state"
+LOG_FILE="/var/log/sitectl.log"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# ==================== HELPER FUNCTIONS ====================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+}
+
+info() {
+    echo -e "${BLUE}ℹ${NC} $*"
+    log "INFO" "$*"
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $*"
+    log "SUCCESS" "$*"
+}
+
+warn() {
+    echo -e "${YELLOW}⚠${NC} $*"
+    log "WARN" "$*"
+}
+
+error() {
+    echo -e "${RED}✗${NC} $*" >&2
+    log "ERROR" "$*"
+}
+
+fatal() {
+    error "$*"
+    exit 1
+}
+
+confirm() {
+    local prompt="$1"
+    local response
+    echo -en "${YELLOW}${prompt}${NC} [y/N] "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        fatal "This command must be run with sudo: sudo sitectl $*"
+    fi
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        fatal "Config file not found: $CONFIG_FILE\nRun 'sudo sitectl install' first or create it manually."
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    
+    # Validate required config
+    if [[ -z "${CF_TOKEN:-}" || "$CF_TOKEN" == "YOUR_CLOUDFLARE_API_TOKEN_HERE" ]]; then
+        fatal "CF_TOKEN not configured in $CONFIG_FILE"
+    fi
+    if [[ -z "${TLS_EMAIL:-}" || "$TLS_EMAIL" == "your-email@example.com" ]]; then
+        fatal "TLS_EMAIL not configured in $CONFIG_FILE"
+    fi
+}
+
+# Ensure state directory exists
+ensure_state_dir() {
+    install -d -m 755 "$STATE_DIR"
+}
+
+# Save state for a domain (for resumable operations)
+save_state() {
+    local domain="$1"
+    local step="$2"
+    ensure_state_dir
+    echo "$step" > "${STATE_DIR}/${domain}.state"
+}
+
+get_state() {
+    local domain="$1"
+    local state_file="${STATE_DIR}/${domain}.state"
+    if [[ -f "$state_file" ]]; then
+        cat "$state_file"
+    else
+        echo "none"
+    fi
+}
+
+clear_state() {
+    local domain="$1"
+    rm -f "${STATE_DIR}/${domain}.state"
+}
+
+# ==================== DOMAIN HELPERS ====================
+
+# Extract the root domain (zone) from a full domain
+# e.g., api.benmadison.dev -> benmadison.dev
+#       benmadison.com -> benmadison.com
+get_root_domain() {
+    local domain="$1"
+    local parts
+    IFS='.' read -ra parts <<< "$domain"
+    local len=${#parts[@]}
+    
+    if [[ $len -lt 2 ]]; then
+        echo "$domain"
+        return
+    fi
+    
+    # Handle common multi-part TLDs
+    local tld="${parts[$((len-1))]}"
+    local sld="${parts[$((len-2))]}"
+    
+    # Check for known two-part TLDs
+    case "$sld.$tld" in
+        co.uk|co.nz|co.au|com.au|org.uk|org.au|net.au|ac.uk|gov.uk)
+            if [[ $len -ge 3 ]]; then
+                echo "${parts[$((len-3))]}.$sld.$tld"
+            else
+                echo "$domain"
+            fi
+            ;;
+        *)
+            echo "$sld.$tld"
+            ;;
+    esac
+}
+
+# Check if domain is a subdomain or root
+is_subdomain() {
+    local domain="$1"
+    local root
+    root="$(get_root_domain "$domain")"
+    [[ "$domain" != "$root" ]]
+}
+
+# ==================== IP DETECTION ====================
+
+get_ipv4() {
+    local ip
+    # Try multiple services in case one is down
+    ip=$(curl -4 -s --max-time 10 https://icanhazip.com 2>/dev/null) || \
+    ip=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null) || \
+    ip=$(curl -4 -s --max-time 10 https://ifconfig.me 2>/dev/null) || \
+    ip=""
+    
+    # Validate it looks like an IP
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$ip"
+    fi
+}
+
+get_ipv6() {
+    local ip
+    ip=$(curl -6 -s --max-time 10 https://icanhazip.com 2>/dev/null) || \
+    ip=$(curl -6 -s --max-time 10 https://api64.ipify.org 2>/dev/null) || \
+    ip=""
+    
+    # Basic IPv6 validation (contains colons)
+    if [[ "$ip" =~ : ]]; then
+        echo "$ip"
+    fi
+}
+
+# ==================== CLOUDFLARE API ====================
+
+cf_api() {
+    local method="$1"
+    local endpoint="$2"
+    local data="${3:-}"
+    
+    local args=(
+        -s
+        -X "$method"
+        -H "Authorization: Bearer ${CF_TOKEN}"
+        -H "Content-Type: application/json"
+    )
+    
+    if [[ -n "$data" ]]; then
+        args+=(-d "$data")
+    fi
+    
+    curl "${args[@]}" "https://api.cloudflare.com/client/v4${endpoint}"
+}
+
+# Get Zone ID for a domain
+cf_get_zone_id() {
+    local root_domain="$1"
+    local response
+    response=$(cf_api GET "/zones?name=${root_domain}&status=active")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    if [[ "$success" != "true" ]]; then
+        error "Failed to query Cloudflare zones"
+        echo "$response" | jq -r '.errors[]?.message // "Unknown error"' >&2
+        return 1
+    fi
+    
+    local zone_id
+    zone_id=$(echo "$response" | jq -r '.result[0].id // empty')
+    if [[ -z "$zone_id" ]]; then
+        error "Zone not found for: $root_domain"
+        return 1
+    fi
+    
+    echo "$zone_id"
+}
+
+# Check if DNS record exists
+cf_get_record() {
+    local zone_id="$1"
+    local record_type="$2"
+    local name="$3"
+    
+    local response
+    response=$(cf_api GET "/zones/${zone_id}/dns_records?type=${record_type}&name=${name}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    if [[ "$success" != "true" ]]; then
+        return 1
+    fi
+    
+    echo "$response" | jq -r '.result[0] // empty'
+}
+
+# Create or update DNS record
+cf_set_record() {
+    local zone_id="$1"
+    local record_type="$2"
+    local name="$3"
+    local content="$4"
+    local proxied="$5"
+    
+    local existing
+    existing=$(cf_get_record "$zone_id" "$record_type" "$name")
+    
+    local data
+    data=$(jq -n \
+        --arg type "$record_type" \
+        --arg name "$name" \
+        --arg content "$content" \
+        --argjson proxied "$proxied" \
+        '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: 1}')
+    
+    if [[ -n "$existing" && "$existing" != "null" ]]; then
+        local existing_id existing_content
+        existing_id=$(echo "$existing" | jq -r '.id')
+        existing_content=$(echo "$existing" | jq -r '.content')
+        
+        if [[ "$existing_content" == "$content" ]]; then
+            info "$record_type record for $name already set to $content"
+            return 0
+        fi
+        
+        warn "$record_type record for $name exists with different IP ($existing_content), updating to $content"
+        local response
+        response=$(cf_api PUT "/zones/${zone_id}/dns_records/${existing_id}" "$data")
+        
+        if [[ $(echo "$response" | jq -r '.success') == "true" ]]; then
+            success "Updated $record_type record for $name"
+            return 0
+        else
+            error "Failed to update $record_type record"
+            echo "$response" | jq -r '.errors[]?.message // "Unknown error"' >&2
+            return 1
+        fi
+    else
+        local response
+        response=$(cf_api POST "/zones/${zone_id}/dns_records" "$data")
+        
+        if [[ $(echo "$response" | jq -r '.success') == "true" ]]; then
+            success "Created $record_type record for $name -> $content"
+            return 0
+        else
+            error "Failed to create $record_type record"
+            echo "$response" | jq -r '.errors[]?.message // "Unknown error"' >&2
+            return 1
+        fi
+    fi
+}
+
+# Delete DNS record
+cf_delete_record() {
+    local zone_id="$1"
+    local record_type="$2"
+    local name="$3"
+    
+    local existing
+    existing=$(cf_get_record "$zone_id" "$record_type" "$name")
+    
+    if [[ -z "$existing" || "$existing" == "null" ]]; then
+        info "No $record_type record found for $name"
+        return 0
+    fi
+    
+    local record_id
+    record_id=$(echo "$existing" | jq -r '.id')
+    
+    local response
+    response=$(cf_api DELETE "/zones/${zone_id}/dns_records/${record_id}")
+    
+    if [[ $(echo "$response" | jq -r '.success') == "true" ]]; then
+        success "Deleted $record_type record for $name"
+        return 0
+    else
+        error "Failed to delete $record_type record"
+        echo "$response" | jq -r '.errors[]?.message // "Unknown error"' >&2
+        return 1
+    fi
+}
+
+# ==================== APACHE HELPERS ====================
+
+apache_site_exists() {
+    local domain="$1"
+    [[ -f "/etc/apache2/sites-available/${domain}.conf" ]]
+}
+
+apache_site_enabled() {
+    local domain="$1"
+    [[ -f "/etc/apache2/sites-enabled/${domain}.conf" ]]
+}
+
+create_apache_http_vhost() {
+    local domain="$1"
+    local docroot="$2"
+    local aliases="$3"
+    
+    local server_alias=""
+    if [[ -n "$aliases" ]]; then
+        server_alias="ServerAlias ${aliases}"
+    fi
+    
+    cat > "/etc/apache2/sites-available/${domain}.conf" <<CONF
+<VirtualHost *:80>
+    ServerName ${domain}
+    ${server_alias}
+    DocumentRoot ${docroot}
+
+    <Directory ${docroot}>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # Redirect to HTTPS (will be handled after SSL is set up)
+    RewriteEngine On
+    RewriteCond %{HTTPS} !=on
+    RewriteRule ^/?(.*) https://%{HTTP_HOST}/\$1 [R=301,L]
+</VirtualHost>
+CONF
+}
+
+create_apache_https_vhost() {
+    local domain="$1"
+    local docroot="$2"
+    local cert_domain="$3"
+    local aliases="$4"
+    
+    local server_alias=""
+    local www_redirect=""
+    
+    if [[ -n "$aliases" ]]; then
+        server_alias="ServerAlias ${aliases}"
+        # Add www to non-www redirect
+        www_redirect="
+    # Redirect www to non-www
+    RewriteEngine On
+    RewriteCond %{HTTP_HOST} ^www\\.(.*)$ [NC]
+    RewriteRule ^(.*)$ https://%1\$1 [R=301,L]"
+    fi
+    
+    cat > "/etc/apache2/sites-available/${domain}-ssl.conf" <<CONF
+<VirtualHost *:443>
+    ServerName ${domain}
+    ${server_alias}
+    DocumentRoot ${docroot}
+
+    <Directory ${docroot}>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/${cert_domain}/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/${cert_domain}/privkey.pem
+
+    Protocols h2 http/1.1
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    ${www_redirect}
+    # Uncomment after confirming HTTPS works:
+    # Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+</VirtualHost>
+CONF
+}
+
+# ==================== COMMANDS ====================
+
+cmd_add() {
+    local domain=""
+    local no_proxy=false
+    local skip_dns=false
+    local skip_ssl=false
+    local wait_time="${DNS_WAIT_SECONDS:-180}"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-proxy)
+                no_proxy=true
+                shift
+                ;;
+            --skip-dns)
+                skip_dns=true
+                shift
+                ;;
+            --skip-ssl)
+                skip_ssl=true
+                shift
+                ;;
+            --wait)
+                wait_time="$2"
+                shift 2
+                ;;
+            -*)
+                fatal "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "$domain" ]]; then
+                    domain="$1"
+                else
+                    fatal "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$domain" ]]; then
+        fatal "Usage: sitectl add <domain> [--no-proxy] [--skip-dns] [--skip-ssl] [--wait <seconds>]"
+    fi
+    
+    # Normalize domain (lowercase, no trailing dot)
+    domain="${domain,,}"
+    domain="${domain%.}"
+    
+    check_root "add $domain"
+    load_config
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  ${BOLD}Adding site: ${GREEN}${domain}${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    local root_domain
+    root_domain=$(get_root_domain "$domain")
+    local is_sub
+    is_sub=$(is_subdomain "$domain" && echo "true" || echo "false")
+    local docroot="/var/www/${domain}"
+    local aliases=""
+    local cert_domains="-d ${domain}"
+    
+    # For root domains, also set up www
+    if [[ "$is_sub" == "false" ]]; then
+        aliases="www.${domain}"
+        cert_domains="-d ${domain} -d www.${domain}"
+        info "Root domain detected - will also configure www.${domain}"
+    fi
+    
+    local proxied="true"
+    if [[ "$no_proxy" == "true" ]]; then
+        proxied="false"
+        info "Cloudflare proxy disabled for this site"
+    fi
+    
+    # Check current state for resume capability
+    local current_state
+    current_state=$(get_state "$domain")
+    
+    # ---- STEP 1: DNS ----
+    if [[ "$current_state" == "none" || "$current_state" == "dns_started" ]]; then
+        if [[ "$skip_dns" == "false" ]]; then
+            info "Step 1/4: Configuring DNS records..."
+            save_state "$domain" "dns_started"
+            
+            local zone_id
+            zone_id=$(cf_get_zone_id "$root_domain") || fatal "Could not get zone ID for $root_domain"
+            
+            local ipv4 ipv6
+            ipv4=$(get_ipv4)
+            ipv6=$(get_ipv6)
+            
+            if [[ -z "$ipv4" ]]; then
+                fatal "Could not detect server IPv4 address"
+            fi
+            
+            # Set A record
+            cf_set_record "$zone_id" "A" "$domain" "$ipv4" "$proxied" || fatal "Failed to set A record"
+            
+            # Set AAAA record if IPv6 available
+            if [[ -n "$ipv6" ]]; then
+                cf_set_record "$zone_id" "AAAA" "$domain" "$ipv6" "$proxied" || fatal "Failed to set AAAA record"
+            else
+                warn "No IPv6 address detected, skipping AAAA record"
+            fi
+            
+            # For root domains, also set www records
+            if [[ "$is_sub" == "false" ]]; then
+                cf_set_record "$zone_id" "A" "www.${domain}" "$ipv4" "$proxied" || fatal "Failed to set www A record"
+                if [[ -n "$ipv6" ]]; then
+                    cf_set_record "$zone_id" "AAAA" "www.${domain}" "$ipv6" "$proxied" || fatal "Failed to set www AAAA record"
+                fi
+            fi
+            
+            save_state "$domain" "dns_complete"
+            success "DNS configuration complete"
+        else
+            info "Step 1/4: Skipping DNS (--skip-dns)"
+            save_state "$domain" "dns_complete"
+        fi
+    else
+        info "Step 1/4: DNS already configured (resuming)"
+    fi
+    
+    # ---- STEP 2: Document Root ----
+    if [[ "$current_state" != "docroot_complete" && "$current_state" != "apache_complete" && "$current_state" != "ssl_complete" ]]; then
+        info "Step 2/4: Setting up document root..."
+        
+        install -d -m 755 "$docroot"
+        
+        if [[ ! -f "$docroot/index.html" && ! -f "$docroot/index.php" ]]; then
+            cat > "$docroot/index.html" <<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${domain}</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+        h1 { color: #333; }
+        .status { color: #28a745; }
+    </style>
+</head>
+<body>
+    <h1>${domain}</h1>
+    <p class="status">✓ Site successfully configured</p>
+    <p>Generated by sitectl on $(date '+%Y-%m-%d %H:%M:%S')</p>
+</body>
+</html>
+HTML
+            success "Created placeholder index.html"
+        else
+            info "Existing content found in $docroot"
+        fi
+        
+        save_state "$domain" "docroot_complete"
+    else
+        info "Step 2/4: Document root already set up (resuming)"
+    fi
+    
+    # ---- STEP 3: Apache HTTP ----
+    if [[ "$current_state" != "apache_complete" && "$current_state" != "ssl_complete" ]]; then
+        info "Step 3/4: Configuring Apache..."
+        
+        create_apache_http_vhost "$domain" "$docroot" "$aliases"
+        success "Created HTTP vhost: /etc/apache2/sites-available/${domain}.conf"
+        
+        a2ensite "${domain}.conf" >/dev/null 2>&1 || true
+        
+        if ! apache2ctl configtest 2>/dev/null; then
+            fatal "Apache configuration test failed. Check /etc/apache2/sites-available/${domain}.conf"
+        fi
+        
+        systemctl reload apache2
+        success "Apache HTTP site enabled and reloaded"
+        
+        save_state "$domain" "apache_complete"
+    else
+        info "Step 3/4: Apache already configured (resuming)"
+    fi
+    
+    # ---- STEP 4: SSL ----
+    if [[ "$skip_ssl" == "false" ]]; then
+        if [[ "$current_state" != "ssl_complete" ]]; then
+            info "Step 4/4: Setting up SSL certificate..."
+            
+            # Wait for DNS propagation if we just set up DNS
+            if [[ "$skip_dns" == "false" && "$current_state" != "ssl_started" ]]; then
+                echo ""
+                info "Waiting ${wait_time} seconds for DNS propagation..."
+                echo -e "  ${CYAN}(This ensures Cloudflare DNS is fully propagated before SSL verification)${NC}"
+                echo ""
+                
+                local elapsed=0
+                while [[ $elapsed -lt $wait_time ]]; do
+                    local remaining=$((wait_time - elapsed))
+                    printf "\r  ⏳ %3d seconds remaining... " "$remaining"
+                    sleep 10
+                    elapsed=$((elapsed + 10))
+                done
+                printf "\r  ✓ Wait complete.                    \n"
+            fi
+            
+            save_state "$domain" "ssl_started"
+            
+            # Ensure Cloudflare credentials file exists
+            install -d -m 700 /root/.secrets
+            local cf_ini="/root/.secrets/cloudflare.ini"
+            printf "dns_cloudflare_api_token = %s\n" "$CF_TOKEN" > "$cf_ini"
+            chmod 600 "$cf_ini"
+            
+            # Request certificate
+            info "Requesting Let's Encrypt certificate via DNS-01 challenge..."
+            
+            # Build certbot command
+            local certbot_cmd=(
+                certbot certonly
+                --dns-cloudflare
+                --dns-cloudflare-credentials "$cf_ini"
+                --dns-cloudflare-propagation-seconds 60
+                --agree-tos
+                -m "$TLS_EMAIL"
+                --non-interactive
+            )
+            
+            # Add domain(s)
+            certbot_cmd+=(-d "$domain")
+            if [[ "$is_sub" == "false" ]]; then
+                certbot_cmd+=(-d "www.${domain}")
+            fi
+            
+            if ! "${certbot_cmd[@]}"; then
+                error "Certificate request failed!"
+                echo ""
+                echo -e "${YELLOW}Troubleshooting tips:${NC}"
+                echo "  1. Ensure DNS has propagated: dig +short ${domain}"
+                echo "  2. Check Cloudflare API token has DNS:Edit permission"
+                echo "  3. Try again with: sudo sitectl add ${domain} --skip-dns"
+                echo ""
+                fatal "SSL setup failed. The HTTP site is still active."
+            fi
+            
+            local cert_domain="$domain"
+            
+            # Create HTTPS vhost
+            create_apache_https_vhost "$domain" "$docroot" "$cert_domain" "$aliases"
+            success "Created HTTPS vhost: /etc/apache2/sites-available/${domain}-ssl.conf"
+            
+            a2ensite "${domain}-ssl.conf" >/dev/null 2>&1 || true
+            
+            if ! apache2ctl configtest 2>/dev/null; then
+                fatal "Apache SSL configuration test failed"
+            fi
+            
+            systemctl reload apache2
+            success "Apache HTTPS site enabled and reloaded"
+            
+            save_state "$domain" "ssl_complete"
+        else
+            info "Step 4/4: SSL already configured (resuming)"
+        fi
+    else
+        info "Step 4/4: Skipping SSL (--skip-ssl)"
+        save_state "$domain" "ssl_skipped"
+    fi
+    
+    # Clear state on success
+    clear_state "$domain"
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  ✓ Site successfully configured: ${domain}${NC}"
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${BOLD}Document Root:${NC}  $docroot"
+    echo -e "  ${BOLD}HTTP Config:${NC}    /etc/apache2/sites-available/${domain}.conf"
+    if [[ "$skip_ssl" == "false" ]]; then
+        echo -e "  ${BOLD}HTTPS Config:${NC}   /etc/apache2/sites-available/${domain}-ssl.conf"
+        echo -e "  ${BOLD}SSL Certs:${NC}      /etc/letsencrypt/live/${domain}/"
+    fi
+    echo ""
+    echo -e "  ${BOLD}URLs:${NC}"
+    echo -e "    https://${domain}"
+    if [[ "$is_sub" == "false" ]]; then
+        echo -e "    https://www.${domain} (redirects to above)"
+    fi
+    echo ""
+}
+
+cmd_remove() {
+    local domain="$1"
+    
+    if [[ -z "$domain" ]]; then
+        fatal "Usage: sitectl remove <domain>"
+    fi
+    
+    domain="${domain,,}"
+    domain="${domain%.}"
+    
+    check_root "remove $domain"
+    load_config
+    
+    echo ""
+    echo -e "${BOLD}${RED}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${RED}║${NC}  ${BOLD}Removing site: ${domain}${NC}"
+    echo -e "${BOLD}${RED}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}This will:${NC}"
+    echo "  • Disable and delete Apache configurations"
+    echo "  • Delete SSL certificates and stop auto-renewal"
+    echo "  • Remove DNS records from Cloudflare"
+    echo ""
+    echo -e "${CYAN}This will NOT delete:${NC}"
+    echo "  • Document root: /var/www/${domain}"
+    echo ""
+    
+    if ! confirm "Are you sure you want to remove ${domain}?"; then
+        echo "Aborted."
+        exit 0
+    fi
+    
+    local root_domain
+    root_domain=$(get_root_domain "$domain")
+    local is_sub
+    is_sub=$(is_subdomain "$domain" && echo "true" || echo "false")
+    
+    # Disable Apache sites
+    info "Disabling Apache sites..."
+    a2dissite "${domain}.conf" 2>/dev/null || true
+    a2dissite "${domain}-ssl.conf" 2>/dev/null || true
+    
+    # Remove Apache configs
+    rm -f "/etc/apache2/sites-available/${domain}.conf"
+    rm -f "/etc/apache2/sites-available/${domain}-ssl.conf"
+    success "Removed Apache configurations"
+    
+    systemctl reload apache2 2>/dev/null || true
+    
+    # Delete SSL certificate
+    if [[ -d "/etc/letsencrypt/live/${domain}" ]]; then
+        info "Deleting SSL certificate..."
+        certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
+        success "Deleted SSL certificate"
+    fi
+    
+    # Remove DNS records
+    info "Removing DNS records..."
+    local zone_id
+    if zone_id=$(cf_get_zone_id "$root_domain" 2>/dev/null); then
+        cf_delete_record "$zone_id" "A" "$domain" || true
+        cf_delete_record "$zone_id" "AAAA" "$domain" || true
+        
+        if [[ "$is_sub" == "false" ]]; then
+            cf_delete_record "$zone_id" "A" "www.${domain}" || true
+            cf_delete_record "$zone_id" "AAAA" "www.${domain}" || true
+        fi
+    else
+        warn "Could not access Cloudflare zone, DNS records may need manual removal"
+    fi
+    
+    # Clear any state
+    clear_state "$domain"
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}✓ Site removed: ${domain}${NC}"
+    echo ""
+    echo -e "${CYAN}Note: Document root preserved at /var/www/${domain}${NC}"
+    echo "Delete manually if no longer needed: sudo rm -rf /var/www/${domain}"
+    echo ""
+}
+
+cmd_list() {
+    check_root "list"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}Configured Sites${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    local sites=()
+    local conf_dir="/etc/apache2/sites-available"
+    
+    # Find all non-ssl configs (to avoid duplicates)
+    for conf in "$conf_dir"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        local name
+        name=$(basename "$conf" .conf)
+        
+        # Skip ssl configs and default configs
+        [[ "$name" == *-ssl ]] && continue
+        [[ "$name" == "000-default" ]] && continue
+        [[ "$name" == "default-ssl" ]] && continue
+        
+        sites+=("$name")
+    done
+    
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        echo "  No sites configured."
+        echo ""
+        return
+    fi
+    
+    printf "  ${BOLD}%-35s %-10s %-10s %-15s${NC}\n" "DOMAIN" "HTTP" "HTTPS" "SSL EXPIRY"
+    echo "  ─────────────────────────────────────────────────────────────────"
+    
+    for site in "${sites[@]}"; do
+        local http_status="disabled"
+        local https_status="disabled"
+        local ssl_expiry="-"
+        
+        if [[ -f "/etc/apache2/sites-enabled/${site}.conf" ]]; then
+            http_status="${GREEN}enabled${NC}"
+        fi
+        
+        if [[ -f "/etc/apache2/sites-enabled/${site}-ssl.conf" ]]; then
+            https_status="${GREEN}enabled${NC}"
+            
+            # Check SSL expiry
+            if [[ -f "/etc/letsencrypt/live/${site}/cert.pem" ]]; then
+                local expiry_date
+                expiry_date=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${site}/cert.pem" 2>/dev/null | cut -d= -f2)
+                if [[ -n "$expiry_date" ]]; then
+                    ssl_expiry=$(date -d "$expiry_date" '+%Y-%m-%d' 2>/dev/null || echo "unknown")
+                fi
+            fi
+        fi
+        
+        printf "  %-35s %-19s %-19s %-15s\n" "$site" "$http_status" "$https_status" "$ssl_expiry"
+    done
+    
+    echo ""
+}
+
+cmd_status() {
+    local domain="$1"
+    
+    if [[ -z "$domain" ]]; then
+        fatal "Usage: sitectl status <domain>"
+    fi
+    
+    domain="${domain,,}"
+    domain="${domain%.}"
+    
+    check_root "status $domain"
+    load_config
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}Status: ${domain}${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    local root_domain
+    root_domain=$(get_root_domain "$domain")
+    local is_sub
+    is_sub=$(is_subdomain "$domain" && echo "true" || echo "false")
+    
+    # Document root
+    echo ""
+    echo -e "${BOLD}Document Root:${NC}"
+    if [[ -d "/var/www/${domain}" ]]; then
+        echo -e "  ${GREEN}✓${NC} /var/www/${domain} exists"
+        local file_count
+        file_count=$(find "/var/www/${domain}" -type f 2>/dev/null | wc -l)
+        echo "    Files: $file_count"
+    else
+        echo -e "  ${RED}✗${NC} /var/www/${domain} does not exist"
+    fi
+    
+    # Apache
+    echo ""
+    echo -e "${BOLD}Apache:${NC}"
+    if [[ -f "/etc/apache2/sites-available/${domain}.conf" ]]; then
+        if [[ -f "/etc/apache2/sites-enabled/${domain}.conf" ]]; then
+            echo -e "  ${GREEN}✓${NC} HTTP site enabled"
+        else
+            echo -e "  ${YELLOW}○${NC} HTTP site available but disabled"
+        fi
+    else
+        echo -e "  ${RED}✗${NC} HTTP site not configured"
+    fi
+    
+    if [[ -f "/etc/apache2/sites-available/${domain}-ssl.conf" ]]; then
+        if [[ -f "/etc/apache2/sites-enabled/${domain}-ssl.conf" ]]; then
+            echo -e "  ${GREEN}✓${NC} HTTPS site enabled"
+        else
+            echo -e "  ${YELLOW}○${NC} HTTPS site available but disabled"
+        fi
+    else
+        echo -e "  ${RED}✗${NC} HTTPS site not configured"
+    fi
+    
+    # SSL Certificate
+    echo ""
+    echo -e "${BOLD}SSL Certificate:${NC}"
+    if [[ -d "/etc/letsencrypt/live/${domain}" ]]; then
+        echo -e "  ${GREEN}✓${NC} Certificate exists"
+        
+        local cert_file="/etc/letsencrypt/live/${domain}/cert.pem"
+        if [[ -f "$cert_file" ]]; then
+            local expiry_date
+            expiry_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            local expiry_epoch
+            expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || echo 0)
+            local now_epoch
+            now_epoch=$(date +%s)
+            local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+            
+            if [[ $days_left -lt 0 ]]; then
+                echo -e "    ${RED}Expired!${NC}"
+            elif [[ $days_left -lt 14 ]]; then
+                echo -e "    ${YELLOW}Expires in $days_left days${NC} ($expiry_date)"
+            else
+                echo -e "    Expires in $days_left days ($expiry_date)"
+            fi
+            
+            # Show SANs
+            local sans
+            sans=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oP 'DNS:\K[^,\s]+' | tr '\n' ', ' | sed 's/,$//')
+            if [[ -n "$sans" ]]; then
+                echo "    Covers: $sans"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} No certificate found"
+    fi
+    
+    # DNS
+    echo ""
+    echo -e "${BOLD}DNS (Cloudflare):${NC}"
+    local zone_id
+    if zone_id=$(cf_get_zone_id "$root_domain" 2>/dev/null); then
+        local a_record aaaa_record
+        a_record=$(cf_get_record "$zone_id" "A" "$domain")
+        aaaa_record=$(cf_get_record "$zone_id" "AAAA" "$domain")
+        
+        if [[ -n "$a_record" && "$a_record" != "null" ]]; then
+            local a_ip a_proxied
+            a_ip=$(echo "$a_record" | jq -r '.content')
+            a_proxied=$(echo "$a_record" | jq -r '.proxied')
+            local proxy_status="direct"
+            [[ "$a_proxied" == "true" ]] && proxy_status="proxied"
+            echo -e "  ${GREEN}✓${NC} A:    $a_ip ($proxy_status)"
+        else
+            echo -e "  ${RED}✗${NC} A:    not set"
+        fi
+        
+        if [[ -n "$aaaa_record" && "$aaaa_record" != "null" ]]; then
+            local aaaa_ip aaaa_proxied
+            aaaa_ip=$(echo "$aaaa_record" | jq -r '.content')
+            aaaa_proxied=$(echo "$aaaa_record" | jq -r '.proxied')
+            local proxy_status="direct"
+            [[ "$aaaa_proxied" == "true" ]] && proxy_status="proxied"
+            echo -e "  ${GREEN}✓${NC} AAAA: $aaaa_ip ($proxy_status)"
+        else
+            echo -e "  ${YELLOW}○${NC} AAAA: not set"
+        fi
+        
+        if [[ "$is_sub" == "false" ]]; then
+            local www_a www_aaaa
+            www_a=$(cf_get_record "$zone_id" "A" "www.${domain}")
+            www_aaaa=$(cf_get_record "$zone_id" "AAAA" "www.${domain}")
+            
+            if [[ -n "$www_a" && "$www_a" != "null" ]]; then
+                echo -e "  ${GREEN}✓${NC} www A record configured"
+            else
+                echo -e "  ${RED}✗${NC} www A record not set"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} Could not access Cloudflare zone"
+    fi
+    
+    # Connectivity test
+    echo ""
+    echo -e "${BOLD}Connectivity:${NC}"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${domain}" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "301" || "$http_code" == "302" ]]; then
+        echo -e "  ${GREEN}✓${NC} HTTP responds (redirects to HTTPS)"
+    elif [[ "$http_code" == "200" ]]; then
+        echo -e "  ${YELLOW}○${NC} HTTP responds (no HTTPS redirect)"
+    elif [[ "$http_code" == "000" ]]; then
+        echo -e "  ${RED}✗${NC} HTTP not responding"
+    else
+        echo -e "  ${YELLOW}○${NC} HTTP responds with status $http_code"
+    fi
+    
+    local https_code
+    https_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${domain}" 2>/dev/null || echo "000")
+    if [[ "$https_code" == "200" ]]; then
+        echo -e "  ${GREEN}✓${NC} HTTPS working"
+    elif [[ "$https_code" == "000" ]]; then
+        echo -e "  ${RED}✗${NC} HTTPS not responding"
+    else
+        echo -e "  ${YELLOW}○${NC} HTTPS responds with status $https_code"
+    fi
+    
+    echo ""
+}
+
+cmd_install() {
+    check_root "install"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}Installing sitectl...${NC}"
+    echo ""
+    
+    # Install dependencies
+    info "Checking dependencies..."
+    local packages_needed=()
+    
+    need apache2ctl || packages_needed+=(apache2)
+    need certbot || packages_needed+=(certbot)
+    python3 -c "import certbot_dns_cloudflare" >/dev/null 2>&1 || packages_needed+=(python3-certbot-dns-cloudflare)
+    need curl || packages_needed+=(curl)
+    need jq || packages_needed+=(jq)
+    
+    if [[ ${#packages_needed[@]} -gt 0 ]]; then
+        info "Installing: ${packages_needed[*]}"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y >/dev/null
+        apt-get install -y "${packages_needed[@]}" >/dev/null
+        success "Dependencies installed"
+    else
+        success "All dependencies already installed"
+    fi
+    
+    # Enable Apache modules
+    info "Enabling Apache modules..."
+    a2enmod ssl headers rewrite http2 >/dev/null 2>&1 || true
+    success "Apache modules enabled"
+    
+    # Create config directory and file
+    info "Creating configuration..."
+    install -d -m 755 /etc/sitectl
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<'CONFIG'
+# sitectl configuration
+# Edit this file with your settings
+
+# Cloudflare API Token
+# Required permissions: Zone:Read, DNS:Edit
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+CF_TOKEN="YOUR_CLOUDFLARE_API_TOKEN_HERE"
+
+# Email for Let's Encrypt registration and renewal notices
+TLS_EMAIL="your-email@example.com"
+
+# How long to wait for DNS propagation (seconds)
+# Default: 180 (3 minutes). Increase if SSL fails.
+DNS_WAIT_SECONDS=180
+CONFIG
+        chmod 600 "$CONFIG_FILE"
+        success "Created config file: $CONFIG_FILE"
+    else
+        info "Config file already exists: $CONFIG_FILE"
+    fi
+    
+    # Create log file
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
+    
+    # Install the script
+    local script_path
+    script_path="$(readlink -f "$0")"
+    
+    if [[ "$script_path" != "/usr/local/bin/sitectl" ]]; then
+        cp "$script_path" /usr/local/bin/sitectl
+        chmod 755 /usr/local/bin/sitectl
+        success "Installed sitectl to /usr/local/bin/sitectl"
+    else
+        info "sitectl already installed in /usr/local/bin"
+    fi
+    
+    # Set up certbot renewal hook
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    install -d -m 755 "$hook_dir"
+    cat > "${hook_dir}/reload-apache.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl reload apache2
+SH
+    chmod +x "${hook_dir}/reload-apache.sh"
+    success "Configured certbot renewal hook"
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  ✓ sitectl installed successfully!${NC}"
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${BOLD}Next steps:${NC}"
+    echo ""
+    echo "  1. Edit the configuration file:"
+    echo -e "     ${CYAN}sudo nano /etc/sitectl/config${NC}"
+    echo ""
+    echo "  2. Set your Cloudflare API token and email"
+    echo ""
+    echo "  3. Add your first site:"
+    echo -e "     ${CYAN}sudo sitectl add example.com${NC}"
+    echo ""
+    echo -e "  Run ${CYAN}sitectl help${NC} for full documentation."
+    echo ""
+}
+
+cmd_help() {
+    cat <<'HELP'
+
+  ╔═══════════════════════════════════════════════════════════════════╗
+  ║                                                                   ║
+  ║   ███████╗██╗████████╗███████╗ ██████╗████████╗██╗                ║
+  ║   ██╔════╝██║╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝██║                ║
+  ║   ███████╗██║   ██║   █████╗  ██║        ██║   ██║                ║
+  ║   ╚════██║██║   ██║   ██╔══╝  ██║        ██║   ██║                ║
+  ║   ███████║██║   ██║   ███████╗╚██████╗   ██║   ███████╗           ║
+  ║   ╚══════╝╚═╝   ╚═╝   ╚══════╝ ╚═════╝   ╚═╝   ╚══════╝           ║
+  ║                                                                   ║
+  ║   Apache Virtual Host Manager with Cloudflare DNS & SSL           ║
+  ║                                                                   ║
+  ╚═══════════════════════════════════════════════════════════════════╝
+
+HELP
+    echo -e "  ${BOLD}VERSION${NC}"
+    echo "    sitectl v${VERSION}"
+    echo ""
+    echo -e "  ${BOLD}USAGE${NC}"
+    echo "    sudo sitectl <command> [options]"
+    echo ""
+    echo -e "  ${BOLD}COMMANDS${NC}"
+    echo ""
+    echo -e "    ${CYAN}add${NC} <domain> [options]"
+    echo "        Create a new site with DNS, Apache vhost, and SSL."
+    echo ""
+    echo "        Options:"
+    echo "          --no-proxy    Disable Cloudflare proxy (orange cloud off)"
+    echo "          --skip-dns    Skip DNS setup (if already configured)"
+    echo "          --skip-ssl    Skip SSL setup (HTTP only)"
+    echo "          --wait <sec>  DNS propagation wait time (default: 180)"
+    echo ""
+    echo "        Examples:"
+    echo "          sudo sitectl add api.example.com"
+    echo "          sudo sitectl add example.com           # Also sets up www"
+    echo "          sudo sitectl add test.example.com --no-proxy"
+    echo ""
+    echo -e "    ${CYAN}remove${NC} <domain>"
+    echo "        Remove a site (disables Apache, deletes SSL, removes DNS)."
+    echo "        Does NOT delete the document root directory."
+    echo ""
+    echo "        Example:"
+    echo "          sudo sitectl remove api.example.com"
+    echo ""
+    echo -e "    ${CYAN}list${NC}"
+    echo "        Show all configured sites with their status."
+    echo ""
+    echo -e "    ${CYAN}status${NC} <domain>"
+    echo "        Show detailed status for a specific site including"
+    echo "        DNS records, SSL expiry, and connectivity tests."
+    echo ""
+    echo "        Example:"
+    echo "          sudo sitectl status example.com"
+    echo ""
+    echo -e "    ${CYAN}install${NC}"
+    echo "        First-time setup: installs dependencies, creates config,"
+    echo "        and sets up the sitectl command."
+    echo ""
+    echo -e "    ${CYAN}help${NC}"
+    echo "        Show this help message."
+    echo ""
+    echo -e "  ${BOLD}CONFIGURATION${NC}"
+    echo ""
+    echo "    Config file: /etc/sitectl/config"
+    echo ""
+    echo "    Required settings:"
+    echo "      CF_TOKEN         Cloudflare API token (Zone:Read, DNS:Edit)"
+    echo "      TLS_EMAIL        Email for Let's Encrypt"
+    echo ""
+    echo "    Optional settings:"
+    echo "      DNS_WAIT_SECONDS How long to wait for DNS propagation (default: 180)"
+    echo ""
+    echo "    To edit:"
+    echo "      sudo nano /etc/sitectl/config"
+    echo ""
+    echo -e "  ${BOLD}CLOUDFLARE API TOKEN${NC}"
+    echo ""
+    echo "    Create a token at: https://dash.cloudflare.com/profile/api-tokens"
+    echo ""
+    echo "    Required permissions:"
+    echo "      • Zone - Zone - Read"
+    echo "      • Zone - DNS - Edit"
+    echo ""
+    echo "    Zone resources: Include - All zones (or specific zones)"
+    echo ""
+    echo -e "  ${BOLD}NEW SERVER SETUP${NC}"
+    echo ""
+    echo "    1. Copy sitectl to the server:"
+    echo "       scp sitectl user@server:~/"
+    echo ""
+    echo "    2. Install:"
+    echo "       sudo bash ~/sitectl install"
+    echo ""
+    echo "    3. Configure:"
+    echo "       sudo nano /etc/sitectl/config"
+    echo ""
+    echo "    4. Add sites:"
+    echo "       sudo sitectl add yourdomain.com"
+    echo ""
+    echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
+    echo ""
+    echo "    SSL fails? Try:"
+    echo "      • Wait longer: sudo sitectl add domain.com --wait 300"
+    echo "      • Skip DNS if already set: sudo sitectl add domain.com --skip-dns"
+    echo "      • Check logs: tail -f /var/log/sitectl.log"
+    echo ""
+    echo "    DNS not updating?"
+    echo "      • Verify API token permissions in Cloudflare dashboard"
+    echo "      • Check the zone exists and is active"
+    echo ""
+    echo "    Resume failed setup:"
+    echo "      • Just run the same add command again"
+    echo "      • sitectl will skip completed steps"
+    echo ""
+    echo -e "  ${BOLD}FILES${NC}"
+    echo ""
+    echo "    /etc/sitectl/config       Configuration file"
+    echo "    /etc/sitectl/state/       State files for resumable operations"
+    echo "    /var/log/sitectl.log      Log file"
+    echo "    /var/www/<domain>/        Document roots"
+    echo ""
+}
+
+# ==================== MAIN ====================
+
+main() {
+    # Ensure log directory exists
+    install -d -m 755 "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE" 2>/dev/null || true
+    
+    local command="${1:-help}"
+    shift || true
+    
+    case "$command" in
+        add|create|new)
+            cmd_add "$@"
+            ;;
+        remove|delete|rm)
+            cmd_remove "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        status|info)
+            cmd_status "$@"
+            ;;
+        install|setup)
+            cmd_install "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            echo "sitectl v${VERSION}"
+            ;;
+        *)
+            error "Unknown command: $command"
+            echo "Run 'sitectl help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
