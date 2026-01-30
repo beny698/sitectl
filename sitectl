@@ -479,7 +479,8 @@ update_site_pull() {
     
     # Check if domain already exists in site-pull
     # Use more specific pattern to avoid matching commented lines
-    if grep -q "^[[:space:]]*${domain})[[:space:]]*OWNER=" "$site_pull" 2>/dev/null; then
+    local domain_escaped="${domain//./\\.}"
+    if grep -q "^[[:space:]]*${domain_escaped})[[:space:]]*OWNER=" "$site_pull" 2>/dev/null; then
         warn "Domain ${domain} already exists in site-pull, skipping update"
         return 0
     fi
