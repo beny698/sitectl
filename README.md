@@ -271,6 +271,28 @@ For Git integration to work, you need:
    - Files: `chmod 0640` (readable by owner and group)
    - Owner: `site_<slug>:site_<slug>`
 
+### site-pull Script Versioning
+
+sitectl automatically versions the `/usr/local/bin/site-pull` script to allow easy rollback if issues occur:
+
+- **Automatic Backup**: Before each modification, a timestamped backup is created in `/var/backups/sitectl/site-pull/`
+- **Backup Format**: `site-pull.YYYYMMDD-HHMMSS` (e.g., `site-pull.20260130-143025`)
+- **Automatic Cleanup**: Last 10 backups are kept; older ones are automatically removed
+- **Automatic Rollback**: If an update fails, the previous version is automatically restored
+
+#### Manual Rollback
+
+If you need to manually restore a previous version:
+
+```bash
+# List available backups
+ls -lh /var/backups/sitectl/site-pull/
+
+# Restore from a specific backup
+sudo cp /var/backups/sitectl/site-pull/site-pull.20260130-143025 \
+     /usr/local/bin/site-pull
+```
+
 ### Slug Naming
 
 The slug determines the Linux username (`site_<slug>`):
@@ -303,6 +325,7 @@ The slug determines the Linux username (`site_<slug>`):
 |`/etc/apache2/sites-available/<domain>.conf`    |HTTP vhost config                   |
 |`/etc/apache2/sites-available/<domain>-ssl.conf`|HTTPS vhost config                  |
 |`/etc/letsencrypt/live/<domain>/`               |SSL certificates                    |
+|`/var/backups/sitectl/site-pull/`               |site-pull script backups (versioning)|
 
 ## Troubleshooting
 

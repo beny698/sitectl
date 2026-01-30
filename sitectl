@@ -18,6 +18,7 @@ VERSION="1.0.0"
 CONFIG_FILE="/etc/sitectl/config"
 STATE_DIR="/etc/sitectl/state"
 LOG_FILE="/var/log/sitectl.log"
+SITE_PULL_BACKUP_DIR="/var/backups/sitectl/site-pull"
 
 # Colors for output
 RED='\033[0;31m'
@@ -477,6 +478,24 @@ update_site_pull() {
         return 0
     fi
     
+    # Create backup directory if it doesn't exist
+    if ! install -d -m 755 "$SITE_PULL_BACKUP_DIR" 2>/dev/null; then
+        warn "Could not create backup directory, continuing without backup"
+    fi
+    
+    # Create timestamped backup before making changes
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_file="${SITE_PULL_BACKUP_DIR}/site-pull.${timestamp}"
+    
+    if [[ -d "$SITE_PULL_BACKUP_DIR" ]]; then
+        if cp -p "$site_pull" "$backup_file" 2>/dev/null; then
+            success "Created backup: ${backup_file}"
+        else
+            warn "Failed to create backup, continuing anyway"
+        fi
+    fi
+    
     # Find the case statement and add new mapping before the default case
     # Look for the line with the *) pattern (default case)
     local line_num
@@ -484,15 +503,40 @@ update_site_pull() {
     
     if [[ -z "$line_num" ]]; then
         error "Could not find default case in site-pull script"
+        # Restore from backup if it exists
+        if [[ -f "$backup_file" ]]; then
+            warn "Restoring from backup..."
+            cp -p "$backup_file" "$site_pull"
+        fi
         return 1
     fi
     
     # Insert the new mapping before the default case
     local new_entry="  ${domain}) OWNER=\"${username}\" ;;"
-    sed -i "${line_num}i\\${new_entry}" "$site_pull" || {
+    if ! sed -i "${line_num}i\\${new_entry}" "$site_pull"; then
         error "Failed to update site-pull script"
+        # Restore from backup if it exists
+        if [[ -f "$backup_file" ]]; then
+            warn "Restoring from backup..."
+            if cp -p "$backup_file" "$site_pull"; then
+                success "Successfully restored site-pull from backup"
+            else
+                error "Failed to restore from backup"
+            fi
+        fi
         return 1
-    }
+    fi
+    
+    # Cleanup old backups (keep last 10)
+    if [[ -d "$SITE_PULL_BACKUP_DIR" ]]; then
+        local backup_count
+        backup_count=$(find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f 2>/dev/null | wc -l)
+        if [[ $backup_count -gt 10 ]]; then
+            # Remove oldest backups, keep newest 10
+            find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f -printf '%T+ %p\n' 2>/dev/null | \
+                sort | head -n -10 | cut -d' ' -f2- | xargs -r rm -f
+        fi
+    fi
     
     success "Added ${domain} -> ${username} mapping to site-pull"
     return 0
@@ -1923,6 +1967,23 @@ HELP
     echo "    Add Git to existing site:"
     echo "      sudo sitectl add-git domain.com"
     echo ""
+    echo -e "  ${BOLD}SITE-PULL SCRIPT VERSIONING${NC}"
+    echo ""
+    echo "    When sitectl updates /usr/local/bin/site-pull, it automatically"
+    echo "    creates timestamped backups in /var/backups/sitectl/site-pull/"
+    echo ""
+    echo "    • Backups are created before each modification"
+    echo "    • Last 10 versions are kept automatically"
+    echo "    • Automatic rollback on update failure"
+    echo ""
+    echo "    Manual rollback:"
+    echo "      # List available backups"
+    echo "      ls -lh /var/backups/sitectl/site-pull/"
+    echo ""
+    echo "      # Restore from a specific backup"
+    echo "      sudo cp /var/backups/sitectl/site-pull/site-pull.YYYYMMDD-HHMMSS \\"
+    echo "           /usr/local/bin/site-pull"
+    echo ""
     echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
     echo ""
     echo "    SSL fails? Try:"
@@ -1940,10 +2001,11 @@ HELP
     echo ""
     echo -e "  ${BOLD}FILES${NC}"
     echo ""
-    echo "    /etc/sitectl/config       Configuration file"
-    echo "    /etc/sitectl/state/       State files for resumable operations"
-    echo "    /var/log/sitectl.log      Log file"
-    echo "    /var/www/<domain>/        Document roots"
+    echo "    /etc/sitectl/config                Configuration file"
+    echo "    /etc/sitectl/state/                State files for resumable operations"
+    echo "    /var/log/sitectl.log               Log file"
+    echo "    /var/www/<domain>/                 Document roots"
+    echo "    /var/backups/sitectl/site-pull/    site-pull script backups"
     echo ""
 }
 
