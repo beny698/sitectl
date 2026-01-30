@@ -577,8 +577,8 @@ cmd_add() {
     load_config
     
     # Acquire lock to prevent concurrent operations on the same domain
-    CURRENT_DOMAIN="$domain"
     acquire_lock "$domain"
+    CURRENT_DOMAIN="$domain"
     
     echo ""
     echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
