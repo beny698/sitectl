@@ -102,15 +102,13 @@ load_config() {
     fi
     
     while IFS='=' read -r key value; do
-        # Remove surrounding quotes and whitespace from both key and value
-        key="${key## }"
-        key="${key%% }"
+        # Trim all leading/trailing whitespace from key and value, then remove surrounding quotes from value
+        key="$(printf '%s' "$key" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
+        value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
         value="${value#\"}"
         value="${value%\"}"
         value="${value#\'}"
         value="${value%\'}"
-        value="${value## }"
-        value="${value%% }"
         
         case "$key" in
             CF_TOKEN) CF_TOKEN="$value" ;;
