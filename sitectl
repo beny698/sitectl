@@ -1248,11 +1248,19 @@ CONFIG
     local script_path
     script_path="$(readlink -f "$0")"
     
-    if [[ -f /usr/local/bin/sitectl ]]; then
+    # Check if script is already at target location
+    if [[ "$script_path" == "/usr/local/bin/sitectl" ]]; then
+        local installed_version
+        installed_version=$(/usr/local/bin/sitectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+        info "sitectl ${installed_version} is already installed at /usr/local/bin/sitectl"
+    elif [[ -f /usr/local/bin/sitectl ]]; then
         local installed_version
         installed_version=$(/usr/local/bin/sitectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
         if [[ "$installed_version" == "v${VERSION}" ]]; then
-            info "sitectl v${VERSION} is already installed"
+            info "sitectl v${VERSION} is already installed, updating from different location"
+            cp "$script_path" /usr/local/bin/sitectl
+            chmod 755 /usr/local/bin/sitectl
+            success "Updated sitectl at /usr/local/bin/sitectl"
         else
             info "Upgrading sitectl from ${installed_version} to v${VERSION}"
             cp "$script_path" /usr/local/bin/sitectl
