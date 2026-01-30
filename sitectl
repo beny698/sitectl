@@ -28,6 +28,18 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
+# Cleanup on exit
+cleanup() {
+    local exit_code=$?
+    # Release any held locks
+    if [[ -n "${CURRENT_DOMAIN:-}" ]]; then
+        release_lock "$CURRENT_DOMAIN" 2>/dev/null || true
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT INT TERM
+
 # ==================== HELPER FUNCTIONS ====================
 
 log() {
@@ -86,8 +98,22 @@ load_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         fatal "Config file not found: $CONFIG_FILE\nRun 'sudo sitectl install' first or create it manually."
     fi
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    
+    while IFS='=' read -r key value; do
+        # Remove surrounding quotes and whitespace
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+        value="${value## }"
+        value="${value%% }"
+        
+        case "$key" in
+            CF_TOKEN) CF_TOKEN="$value" ;;
+            TLS_EMAIL) TLS_EMAIL="$value" ;;
+            DNS_WAIT_SECONDS) DNS_WAIT_SECONDS="$value" ;;
+        esac
+    done < <(grep -v '^\s*#' "$CONFIG_FILE" | grep '=')
     
     # Validate required config
     if [[ -z "${CF_TOKEN:-}" || "$CF_TOKEN" == "YOUR_CLOUDFLARE_API_TOKEN_HERE" ]]; then
@@ -124,6 +150,34 @@ get_state() {
 clear_state() {
     local domain="$1"
     rm -f "${STATE_DIR}/${domain}.state"
+}
+
+validate_domain() {
+    local domain="$1"
+    # Only allow valid domain characters: lowercase letters, numbers, hyphens, and dots
+    if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]]; then
+        fatal "Invalid domain name: $domain"
+    fi
+    # Ensure reasonable length
+    if [[ ${#domain} -gt 253 ]]; then
+        fatal "Domain name too long: $domain"
+    fi
+}
+
+acquire_lock() {
+    local domain="$1"
+    local lock_file="/var/lock/sitectl-${domain}.lock"
+    exec 200>"$lock_file"
+    if ! flock -n 200; then
+        fatal "Another sitectl process is already working on $domain"
+    fi
+}
+
+release_lock() {
+    local domain="$1"
+    local lock_file="/var/lock/sitectl-${domain}.lock"
+    flock -u 200 2>/dev/null || true
+    rm -f "$lock_file"
 }
 
 # ==================== DOMAIN HELPERS ====================
@@ -484,8 +538,15 @@ cmd_add() {
     domain="${domain,,}"
     domain="${domain%.}"
     
+    # Validate domain name
+    validate_domain "$domain"
+    
     check_root "add $domain"
     load_config
+    
+    # Acquire lock to prevent concurrent operations on the same domain
+    CURRENT_DOMAIN="$domain"
+    acquire_lock "$domain"
     
     echo ""
     echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -739,8 +800,15 @@ cmd_remove() {
     domain="${domain,,}"
     domain="${domain%.}"
     
+    # Validate domain name
+    validate_domain "$domain"
+    
     check_root "remove $domain"
     load_config
+    
+    # Acquire lock to prevent concurrent operations on the same domain
+    CURRENT_DOMAIN="$domain"
+    acquire_lock "$domain"
     
     echo ""
     echo -e "${BOLD}${RED}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -882,6 +950,9 @@ cmd_status() {
     
     domain="${domain,,}"
     domain="${domain%.}"
+    
+    # Validate domain name
+    validate_domain "$domain"
     
     check_root "status $domain"
     load_config
