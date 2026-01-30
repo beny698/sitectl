@@ -14,6 +14,7 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 ## Features
 
 - **One-command site setup** - DNS, Apache vhost, and SSL in a single command
+- **Git integration** - Automatically clone GitHub repositories and set up deployment workflow (enabled by default)
 - **Cloudflare DNS integration** - Automatically creates/updates A and AAAA records
 - **Let’s Encrypt SSL** - Uses DNS-01 challenge via Cloudflare (works even before DNS propagates publicly)
 - **IPv4 + IPv6 support** - Auto-detects and configures both
@@ -88,14 +89,19 @@ That’s it! Your site is now live at `https://yourdomain.com` with:
 
 ### `sitectl add <domain> [options]`
 
-Create a new site with DNS, Apache, and SSL.
+Create a new site with DNS, Apache, and SSL. **Git integration is enabled by default** - you'll be prompted for GitHub repository URL and slug.
 
 ```bash
-# Add a subdomain
+# Add a subdomain with Git integration (default)
 sudo sitectl add api.example.com
+# Prompts for: GitHub repo URL, slug (suggests "api")
+# Creates: site_api user, clones repo, updates site-pull
 
 # Add a root domain (also configures www)
 sudo sitectl add example.com
+
+# Skip Git integration
+sudo sitectl add api.example.com --without-git
 
 # Disable Cloudflare proxy (direct connection)
 sudo sitectl add api.example.com --no-proxy
@@ -111,6 +117,16 @@ sudo sitectl add api.example.com --wait 300
 
 # Preview changes without executing (dry run)
 sudo sitectl add example.com --dry-run
+```
+
+### `sitectl add-git <domain>`
+
+Add Git integration to an existing site.
+
+```bash
+sudo sitectl add-git oldsite.example.com
+# Prompts for: GitHub repo URL, slug
+# Creates: Linux user, clones/registers repo, updates site-pull
 ```
 
 ### `sitectl remove <domain>`
@@ -173,6 +189,96 @@ sudo bash sitectl install
 ### `sitectl help`
 
 Display full documentation.
+
+## Git Integration
+
+sitectl includes built-in Git integration for automatic repository deployment. When enabled (default), it creates a Linux user, clones your GitHub repository, and integrates with the site-pull deployment script.
+
+### Quick Start with Git
+
+```bash
+# Add a new site with Git integration (default behavior)
+sudo sitectl add api.example.com
+
+# You'll be prompted for:
+# - GitHub repository URL (SSH format): git@github.com:user/repo.git
+# - Slug for Linux user (default suggested): api
+```
+
+This automatically:
+1. Creates Linux user `site_api` with home directory at `/var/www/api.example.com`
+2. Clones your repository into the document root
+3. Updates `/usr/local/bin/site-pull` with domain mapping
+4. Sets permissions (directories: 2750, files: 0640)
+
+### Deploy Updates
+
+After making changes to your repository:
+
+```bash
+sudo /usr/local/bin/site-pull api.example.com
+```
+
+This pulls the latest code from GitHub and sets the correct permissions.
+
+### Add Git to Existing Site
+
+For sites created without Git integration:
+
+```bash
+sudo sitectl add-git oldsite.example.com
+```
+
+You'll be prompted for the repository URL and slug. If the site already has a `.git` directory, it will just register with site-pull without cloning.
+
+### Skip Git Integration
+
+To create a site without Git integration (traditional behavior):
+
+```bash
+sudo sitectl add example.com --without-git
+```
+
+### Requirements
+
+For Git integration to work, you need:
+
+1. **SSH Deploy Key** - Located at `/root/.ssh/github_account`
+   - Generate with: `ssh-keygen -t ed25519 -f /root/.ssh/github_account -C "deploy@yourserver"`
+   - Add the public key to your GitHub repository: Settings → Deploy keys → Add deploy key
+
+2. **site-pull Script** - Located at `/usr/local/bin/site-pull`
+   - This script handles deployment and permission management
+   - sitectl automatically updates it with new domain mappings
+
+### How It Works
+
+1. **Linux User**: Each site gets a dedicated user `site_<slug>` (e.g., `site_api`)
+   - User is added to `www-data` group for Apache access
+   - Home directory is the site's document root
+
+2. **Repository Clone**: Uses SSH with the deploy key
+   - Environment: `GIT_SSH_COMMAND="ssh -i /root/.ssh/github_account"`
+   - Clones directly into `/var/www/<domain>/`
+
+3. **site-pull Integration**: Adds domain mapping to the case statement
+   ```bash
+   api.example.com) OWNER="site_api" ;;
+   ```
+
+4. **Permissions**: Matches site-pull script
+   - Directories: `chmod 2750` (setgid for group inheritance)
+   - Files: `chmod 0640` (readable by owner and group)
+   - Owner: `site_<slug>:site_<slug>`
+
+### Slug Naming
+
+The slug determines the Linux username (`site_<slug>`):
+
+- Subdomains: First part is suggested (e.g., `api.example.com` → `api`)
+- Root domains: Domain name is suggested (e.g., `example.com` → `example`)
+- Must be unique (validated against existing users)
+- Alphanumeric, hyphens, and underscores only
 
 ## Creating a Cloudflare API Token
 
