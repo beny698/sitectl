@@ -1030,7 +1030,11 @@ cmd_add() {
                 info "Moving repository contents to ${docroot}..."
                 # Use rsync for safer file transfer
                 if command_exists rsync; then
-                    rsync -a --remove-source-files "$temp_clone/" "$docroot/" && rm -rf "$temp_clone"
+                    if ! rsync -a --remove-source-files "$temp_clone/" "$docroot/"; then
+                        rm -rf "$temp_clone" 2>/dev/null || true
+                        fatal "Failed to move repository contents"
+                    fi
+                    rm -rf "$temp_clone" 2>/dev/null || true
                 else
                     # Fallback to mv/cp with trap to ensure dotglob is reset
                     shopt -s dotglob
