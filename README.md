@@ -23,6 +23,9 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 - **Cloudflare proxy** - Enabled by default (orange cloud), optional `--no-proxy` flag
 - **Resumable operations** - If setup fails midway, just run again to continue
 - **Safe removal** - Cleans up DNS, SSL, and Apache but preserves your files
+- **Preview mode** - Use `--dry-run` to see what changes would be made without executing them
+- **Security hardened** - Safe config parsing, domain validation, and concurrency protection
+- **Concurrent execution protection** - Lock files prevent multiple operations on the same domain
 
 ## Requirements
 
@@ -36,7 +39,7 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 
 ```bash
 # Download the script
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/sitectl/main/sitectl
+curl -O https://raw.githubusercontent.com/beny698/sitectl/main/sitectl
 
 # Run the installer (installs dependencies, creates config)
 sudo bash sitectl install
@@ -59,7 +62,13 @@ TLS_EMAIL="you@example.com"
 
 # Optional: DNS propagation wait time in seconds (default: 180)
 DNS_WAIT_SECONDS=180
+
+# Optional: Server IP addresses (auto-detected if not set)
+# SERVER_IPV4="1.2.3.4"
+# SERVER_IPV6="2001:db8::1"
 ```
+
+**Note**: Server IPs are auto-detected by default. Only set `SERVER_IPV4` or `SERVER_IPV6` if auto-detection doesn't work in your environment.
 
 ### 3. Add Your First Site
 
@@ -99,6 +108,9 @@ sudo sitectl add api.example.com --skip-ssl
 
 # Custom DNS propagation wait time
 sudo sitectl add api.example.com --wait 300
+
+# Preview changes without executing (dry run)
+sudo sitectl add example.com --dry-run
 ```
 
 ### `sitectl remove <domain>`
