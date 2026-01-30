@@ -307,9 +307,9 @@ user_exists() {
 validate_slug() {
     local slug="$1"
     
-    # Validate slug format (alphanumeric and hyphens/underscores only)
-    if ! [[ "$slug" =~ ^[a-z0-9_-]+$ ]]; then
-        error "Invalid slug format. Use only lowercase letters, numbers, hyphens, and underscores."
+    # Validate slug format (alphanumeric, hyphens, underscores; no leading/trailing hyphens)
+    if ! [[ "$slug" =~ ^[a-z0-9_][a-z0-9_-]*[a-z0-9_]$ ]] && ! [[ "$slug" =~ ^[a-z0-9_]$ ]]; then
+        error "Invalid slug format. Use lowercase letters, numbers, hyphens (not at start/end), and underscores."
         return 1
     fi
     
@@ -419,7 +419,9 @@ clone_git_repo() {
     fi
     
     # Make Git trust the directory
-    git config --global --add safe.directory "$dest_dir" || true
+    if ! git config --global --add safe.directory "$dest_dir"; then
+        warn "Could not add ${dest_dir} to Git safe directories"
+    fi
     
     success "Repository cloned successfully"
     return 0
@@ -953,30 +955,46 @@ cmd_add() {
             slug=$(prompt_for_slug "$domain")
             echo ""
             
-            # Create document root directory first (will be used as home dir)
-            install -d -m 755 "$docroot"
-            
-            # Create Linux user
+            # Create Linux user (will create home directory at docroot)
             create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
             
             # Remove placeholder index.html if it exists
-            rm -f "$docroot/index.html"
+            rm -f "$docroot/index.html" 2>/dev/null || true
             
             # Clone the repository directly into the document root
             # The directory must be empty, so we'll use a temp dir first
-            local temp_clone="/tmp/sitectl-clone-$$"
+            local temp_clone
+            temp_clone=$(mktemp -d) || {
+                error "Failed to create temporary directory"
+                fatal "Failed to clone repository"
+            }
+            
             if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
                 # Move contents from temp to docroot
                 info "Moving repository contents to ${docroot}..."
-                shopt -s dotglob
-                mv "$temp_clone"/* "$docroot/" 2>/dev/null || {
-                    # If mv fails, try cp and rm
-                    cp -a "$temp_clone"/* "$docroot/"
-                    rm -rf "$temp_clone"
-                }
-                shopt -u dotglob
-                rm -rf "$temp_clone" 2>/dev/null || true
+                # Use rsync for safer file transfer
+                if command_exists rsync; then
+                    rsync -a --remove-source-files "$temp_clone/" "$docroot/" && rm -rf "$temp_clone"
+                else
+                    # Fallback to mv/cp with trap to ensure dotglob is reset
+                    shopt -s dotglob
+                    local move_success=false
+                    if mv "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        move_success=true
+                    elif cp -a "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        rm -rf "$temp_clone"
+                        move_success=true
+                    fi
+                    shopt -u dotglob
+                    
+                    if [[ "$move_success" != "true" ]]; then
+                        rm -rf "$temp_clone" 2>/dev/null || true
+                        fatal "Failed to move repository contents"
+                    fi
+                    rm -rf "$temp_clone" 2>/dev/null || true
+                fi
             else
+                rm -rf "$temp_clone" 2>/dev/null || true
                 fatal "Failed to clone repository"
             fi
             
@@ -1209,7 +1227,19 @@ cmd_add_git() {
         info "Creating Linux user for site..."
         create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
     else
-        info "User site_${slug} already exists"
+        # User exists - verify home directory matches
+        local existing_home
+        existing_home=$(getent passwd "site_${slug}" | cut -d: -f6)
+        if [[ "$existing_home" != "$docroot" ]]; then
+            warn "User site_${slug} exists with different home directory: ${existing_home}"
+            warn "Expected: ${docroot}"
+            if ! confirm "Continue anyway?"; then
+                info "Aborted."
+                return 0
+            fi
+        else
+            info "User site_${slug} already exists with correct home directory"
+        fi
     fi
     
     # Handle repository setup
@@ -1225,8 +1255,8 @@ cmd_add_git() {
             echo ""
             
             if ! confirm "Clone will replace existing content. Backup first?"; then
-                echo "Aborted."
-                exit 0
+                info "Aborted."
+                return 0
             fi
             
             # Create backup
@@ -1238,21 +1268,44 @@ cmd_add_git() {
             
             # Remove existing files
             info "Removing existing files from ${docroot}..."
-            find "$docroot" -mindepth 1 -delete
+            # Safety check: ensure docroot starts with /var/www/
+            if [[ "$docroot" == /var/www/* && -d "$docroot" ]]; then
+                rm -rf "${docroot:?}"/*
+            else
+                error "Invalid document root path: ${docroot}"
+                return 1
+            fi
         fi
         
         # Clone repository
-        local temp_clone="/tmp/sitectl-clone-$$"
+        local temp_clone
+        temp_clone=$(mktemp -d) || {
+            error "Failed to create temporary directory"
+            fatal "Failed to clone repository"
+        }
+        
         if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
             info "Moving repository contents to ${docroot}..."
-            shopt -s dotglob
-            mv "$temp_clone"/* "$docroot/" 2>/dev/null || {
-                cp -a "$temp_clone"/* "$docroot/"
-                rm -rf "$temp_clone"
-            }
-            shopt -u dotglob
-            rm -rf "$temp_clone" 2>/dev/null || true
+            # Use rsync for safer file transfer
+            if command_exists rsync; then
+                rsync -a --remove-source-files "$temp_clone/" "$docroot/" && rm -rf "$temp_clone"
+            else
+                # Fallback to mv/cp
+                shopt -s dotglob
+                if ! mv "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                    if cp -a "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        rm -rf "$temp_clone"
+                    else
+                        shopt -u dotglob
+                        error "Failed to move repository contents"
+                        fatal "Failed to clone repository"
+                    fi
+                fi
+                shopt -u dotglob
+                rm -rf "$temp_clone" 2>/dev/null || true
+            fi
         else
+            rm -rf "$temp_clone" 2>/dev/null || true
             fatal "Failed to clone repository"
         fi
         
