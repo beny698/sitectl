@@ -18,6 +18,7 @@ VERSION="1.0.0"
 CONFIG_FILE="/etc/sitectl/config"
 STATE_DIR="/etc/sitectl/state"
 LOG_FILE="/var/log/sitectl.log"
+SITE_PULL_BACKUP_DIR="/var/backups/sitectl/site-pull"
 
 # Colors for output
 RED='\033[0;31m'
@@ -278,6 +279,299 @@ get_ipv6() {
     fi
 }
 
+# ==================== GIT INTEGRATION HELPERS ====================
+
+# Suggest slug from domain
+# api.benmadison.dev -> api
+# benmadison.dev -> benmadison
+suggest_slug() {
+    local domain="$1"
+    local root_domain
+    root_domain=$(get_root_domain "$domain")
+    
+    # If it's a subdomain, extract the first part
+    if [[ "$domain" != "$root_domain" ]]; then
+        echo "$domain" | cut -d. -f1
+    else
+        # For root domains, use the domain name without TLD
+        echo "$domain" | cut -d. -f1
+    fi
+}
+
+# Check if Linux user exists
+user_exists() {
+    local username="$1"
+    id "$username" &>/dev/null
+}
+
+# Validate slug and check if site_<slug> user doesn't exist
+validate_slug() {
+    local slug="$1"
+    
+    # Validate slug format (alphanumeric, hyphens, underscores; no leading/trailing hyphens)
+    if ! [[ "$slug" =~ ^[a-z0-9_][a-z0-9_-]*[a-z0-9_]$ ]] && ! [[ "$slug" =~ ^[a-z0-9_]$ ]]; then
+        error "Invalid slug format. Use lowercase letters, numbers, hyphens (not at start/end), and underscores."
+        return 1
+    fi
+    
+    # Check if user already exists
+    if user_exists "site_${slug}"; then
+        error "User site_${slug} already exists. Choose a different slug."
+        return 1
+    fi
+    
+    return 0
+}
+
+# Prompt for slug with smart default
+prompt_for_slug() {
+    local domain="$1"
+    local default_slug
+    default_slug=$(suggest_slug "$domain")
+    
+    local slug
+    while true; do
+        echo -en "${CYAN}Enter slug for Linux user${NC} [${default_slug}]: "
+        read -r slug
+        
+        # Use default if empty
+        if [[ -z "$slug" ]]; then
+            slug="$default_slug"
+        fi
+        
+        # Validate slug
+        if validate_slug "$slug"; then
+            echo "$slug"
+            return 0
+        fi
+    done
+}
+
+# Create Linux user for site
+create_site_user() {
+    local slug="$1"
+    local docroot="$2"
+    local username="site_${slug}"
+    
+    info "Creating Linux user: ${username}"
+    
+    # Create user with home directory at docroot, no login shell
+    local useradd_args=(-r -d "$docroot" -s /usr/sbin/nologin -c "Site user for ${slug}")
+    # Only request home directory creation if it does not already exist
+    if [[ ! -d "$docroot" ]]; then
+        useradd_args+=(-m)
+    fi
+    useradd "${useradd_args[@]}" "$username" || {
+        error "Failed to create user ${username}"
+        return 1
+    }
+    
+    # Add user to www-data group for Apache access
+    usermod -a -G www-data "$username" || {
+        error "Failed to add ${username} to www-data group"
+        return 1
+    }
+    
+    success "Created user ${username} (home: ${docroot})"
+    return 0
+}
+
+# Ensure GitHub host key is trusted
+ensure_github_host_key() {
+    mkdir -p /root/.ssh
+    touch /root/.ssh/known_hosts
+    chmod 600 /root/.ssh/known_hosts
+    
+    if ! ssh-keygen -F github.com >/dev/null 2>&1; then
+        info "Adding GitHub host key to known_hosts..."
+        ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null || {
+            warn "Failed to add GitHub host key, continuing anyway..."
+        }
+    fi
+}
+
+# Clone GitHub repository
+clone_git_repo() {
+    local repo_url="$1"
+    local dest_dir="$2"
+    local slug="$3"
+    local username="site_${slug}"
+    
+    # Check if git is installed
+    if ! command_exists git; then
+        error "Git is not installed. Please install it first: sudo apt-get install git"
+        return 1
+    fi
+    
+    # Check if deploy key exists
+    if [[ ! -f /root/.ssh/github_account ]]; then
+        error "SSH deploy key not found at /root/.ssh/github_account"
+        error "Generate one with: ssh-keygen -t ed25519 -f /root/.ssh/github_account"
+        return 1
+    fi
+    
+    info "Cloning repository: ${repo_url}"
+    
+    # Ensure GitHub host key is trusted
+    ensure_github_host_key
+    
+    # Set up SSH command with deploy key
+    export GIT_SSH_COMMAND="ssh -i /root/.ssh/github_account -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    
+    # Clone the repository
+    if ! git clone "$repo_url" "$dest_dir" 2>&1; then
+        error "Failed to clone repository"
+        return 1
+    fi
+    
+    # Make Git trust the directory
+    if ! git config --global --add safe.directory "$dest_dir"; then
+        warn "Could not add ${dest_dir} to Git safe directories"
+    fi
+    
+    success "Repository cloned successfully"
+    return 0
+}
+
+# Set permissions on document root (matching site-pull)
+set_site_permissions() {
+    local docroot="$1"
+    local slug="$2"
+    local username="site_${slug}"
+    
+    info "Setting ownership and permissions..."
+    
+    # Set ownership
+    chown -R "$username:$username" "$docroot" || {
+        error "Failed to set ownership"
+        return 1
+    }
+    
+    # Set directory permissions: 2750 (setgid, rwxr-x---)
+    find "$docroot" -type d -exec chmod 2750 {} \; || {
+        error "Failed to set directory permissions"
+        return 1
+    }
+    
+    # Set file permissions: 0640 (rw-r-----)
+    find "$docroot" -type f -exec chmod 0640 {} \; || {
+        error "Failed to set file permissions"
+        return 1
+    }
+    
+    success "Permissions set (dirs: 2750, files: 0640, owner: ${username})"
+    return 0
+}
+
+# Update site-pull script with domain mapping
+update_site_pull() {
+    local domain="$1"
+    local slug="$2"
+    local site_pull="/usr/local/bin/site-pull"
+    local username="site_${slug}"
+    
+    info "Updating site-pull script..."
+    
+    if [[ ! -f "$site_pull" ]]; then
+        error "site-pull script not found at ${site_pull}"
+        return 1
+    fi
+    
+    # Check if domain already exists in site-pull
+    # Use more specific pattern to avoid matching commented lines
+    local domain_escaped="${domain//./\\.}"
+    if grep -q "^[[:space:]]*${domain_escaped})[[:space:]]*OWNER=" "$site_pull" 2>/dev/null; then
+        warn "Domain ${domain} already exists in site-pull, skipping update"
+        return 0
+    fi
+    
+    # Create backup directory if it doesn't exist
+    if ! install -d -m 755 "$SITE_PULL_BACKUP_DIR" 2>/dev/null; then
+        warn "Could not create backup directory, continuing without backup"
+    fi
+    
+    # Create timestamped backup before making changes
+    # Use nanoseconds in timestamp to avoid collisions in rapid operations
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S-%N)
+    local backup_file="${SITE_PULL_BACKUP_DIR}/site-pull.${timestamp}"
+    
+    # Attempt backup creation (simplified - just try the copy)
+    if cp -p "$site_pull" "$backup_file" 2>/dev/null; then
+        success "Created backup: ${backup_file}"
+    else
+        warn "Failed to create backup, continuing anyway"
+        backup_file=""  # Clear backup_file if backup failed
+    fi
+    
+    # Find the case statement and add new mapping before the default case
+    # Look for the line with the *) pattern (default case)
+    # Use portable [[:space:]] instead of \s
+    local line_num
+    line_num=$(grep -n '^[[:space:]]*\*)' "$site_pull" | head -1 | cut -d: -f1)
+    
+    if [[ -z "$line_num" ]]; then
+        error "Could not find default case in site-pull script"
+        # Restore from backup if it exists
+        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+            warn "Restoring from backup..."
+            cp -p "$backup_file" "$site_pull"
+        else
+            warn "No backup available for rollback"
+        fi
+        return 1
+    fi
+    
+    # Insert the new mapping before the default case
+    local new_entry="  ${domain}) OWNER=\"${username}\" ;;"
+    if ! sed -i "${line_num}i\\${new_entry}" "$site_pull"; then
+        error "Failed to update site-pull script"
+        # Restore from backup if it exists
+        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+            warn "Restoring from backup..."
+            if cp -p "$backup_file" "$site_pull"; then
+                success "Successfully restored site-pull from backup"
+            else
+                error "Failed to restore from backup"
+            fi
+        else
+            warn "No backup available for rollback"
+        fi
+        return 1
+    fi
+    
+    # Cleanup old backups (keep last 10)
+    if [[ -d "$SITE_PULL_BACKUP_DIR" ]]; then
+        local backup_count
+        backup_count=$(find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f 2>/dev/null | wc -l)
+        if [[ $backup_count -gt 10 ]]; then
+            # Remove oldest backups, keep newest 10
+            find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f -printf '%T+ %p\n' 2>/dev/null | \
+                sort | head -n -10 | cut -d' ' -f2- | xargs -r rm -f
+        fi
+    fi
+    
+    success "Added ${domain} -> ${username} mapping to site-pull"
+    return 0
+}
+
+# Prompt for GitHub repository URL
+prompt_for_repo_url() {
+    local repo_url
+    while true; do
+        echo -en "${CYAN}Enter GitHub repository URL (SSH format)${NC}: "
+        read -r repo_url
+        
+        # Validate SSH format
+        if [[ "$repo_url" =~ ^git@github\.com:.+/.+\.git$ ]]; then
+            echo "$repo_url"
+            return 0
+        else
+            error "Invalid format. Expected: git@github.com:user/repo.git"
+        fi
+    done
+}
+
 # ==================== CLOUDFLARE API ====================
 
 cf_api() {
@@ -524,6 +818,7 @@ cmd_add() {
     local skip_ssl=false
     local wait_time="${DNS_WAIT_SECONDS:-180}"
     local dry_run=false
+    local with_git=true
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -548,6 +843,10 @@ cmd_add() {
                 dry_run=true
                 shift
                 ;;
+            --without-git)
+                with_git=false
+                shift
+                ;;
             -*)
                 fatal "Unknown option: $1"
                 ;;
@@ -563,7 +862,7 @@ cmd_add() {
     done
     
     if [[ -z "$domain" ]]; then
-        fatal "Usage: sitectl add <domain> [--no-proxy] [--skip-dns] [--skip-ssl] [--wait <seconds>] [--dry-run]"
+        fatal "Usage: sitectl add <domain> [--no-proxy] [--skip-dns] [--skip-ssl] [--wait <seconds>] [--dry-run] [--without-git]"
     fi
     
     # Normalize domain (lowercase, no trailing dot)
@@ -632,6 +931,16 @@ cmd_add() {
         echo "  • Apache HTTP config: /etc/apache2/sites-available/${domain}.conf"
         [[ "$skip_ssl" == "false" ]] && echo "  • Apache HTTPS config: /etc/apache2/sites-available/${domain}-ssl.conf"
         echo ""
+        echo "Git Integration:"
+        if [[ "$with_git" == "true" ]]; then
+            echo "  • Would prompt for GitHub repository URL and slug"
+            echo "  • Would create Linux user: site_<slug>"
+            echo "  • Would clone repository to ${docroot}"
+            echo "  • Would update /usr/local/bin/site-pull"
+        else
+            echo "  • Git integration skipped (--without-git)"
+        fi
+        echo ""
         echo "SSL Certificate:"
         if [[ "$skip_ssl" == "false" ]]; then
             echo "  • Would request certificate for: ${domain}$([[ "$is_sub" == "false" ]] && echo ", www.${domain}")"
@@ -691,14 +1000,79 @@ cmd_add() {
         info "Step 1/4: DNS already configured (resuming)"
     fi
     
-    # ---- STEP 2: Document Root ----
+    # ---- STEP 2: Document Root & Git Integration ----
     if [[ "$current_state" != "docroot_complete" && "$current_state" != "apache_complete" && "$current_state" != "ssl_complete" ]]; then
-        info "Step 2/4: Setting up document root..."
-        
-        install -d -m 755 "$docroot"
-        
-        if [[ ! -f "$docroot/index.html" && ! -f "$docroot/index.php" ]]; then
-            cat > "$docroot/index.html" <<HTML
+        if [[ "$with_git" == "true" ]]; then
+            info "Step 2/4: Setting up document root with Git integration..."
+            
+            # Prompt for Git repository and slug
+            echo ""
+            local repo_url slug
+            repo_url=$(prompt_for_repo_url)
+            slug=$(prompt_for_slug "$domain")
+            echo ""
+            
+            # Create Linux user (will create home directory at docroot)
+            create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
+            
+            # Remove placeholder index.html if it exists
+            rm -f "$docroot/index.html" 2>/dev/null || true
+            
+            # Clone the repository directly into the document root
+            # The directory must be empty, so we'll use a temp dir first
+            local temp_clone
+            temp_clone=$(mktemp -d) || {
+                error "Failed to create temporary directory"
+                fatal "Failed to clone repository"
+            }
+            
+            if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
+                # Move contents from temp to docroot
+                info "Moving repository contents to ${docroot}..."
+                # Use rsync for safer file transfer
+                if command_exists rsync; then
+                    if ! rsync -a --remove-source-files "$temp_clone/" "$docroot/"; then
+                        rm -rf "$temp_clone" 2>/dev/null || true
+                        fatal "Failed to move repository contents"
+                    fi
+                    rm -rf "$temp_clone" 2>/dev/null || true
+                else
+                    # Fallback to mv/cp with trap to ensure dotglob is reset
+                    shopt -s dotglob
+                    local move_success=false
+                    if mv "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        move_success=true
+                    elif cp -a "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        rm -rf "$temp_clone"
+                        move_success=true
+                    fi
+                    shopt -u dotglob
+                    
+                    if [[ "$move_success" != "true" ]]; then
+                        rm -rf "$temp_clone" 2>/dev/null || true
+                        fatal "Failed to move repository contents"
+                    fi
+                    rm -rf "$temp_clone" 2>/dev/null || true
+                fi
+            else
+                rm -rf "$temp_clone" 2>/dev/null || true
+                fatal "Failed to clone repository"
+            fi
+            
+            # Update site-pull script
+            update_site_pull "$domain" "$slug" || warn "Failed to update site-pull, you may need to do this manually"
+            
+            # Set permissions
+            set_site_permissions "$docroot" "$slug" || fatal "Failed to set permissions"
+            
+            success "Document root set up with Git integration"
+        else
+            info "Step 2/4: Setting up document root (without Git)..."
+            
+            install -d -m 755 "$docroot"
+            
+            if [[ ! -f "$docroot/index.html" && ! -f "$docroot/index.php" ]]; then
+                cat > "$docroot/index.html" <<HTML
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -718,9 +1092,10 @@ cmd_add() {
 </body>
 </html>
 HTML
-            success "Created placeholder index.html"
-        else
-            info "Existing content found in $docroot"
+                success "Created placeholder index.html"
+            else
+                info "Existing content found in $docroot"
+            fi
         fi
         
         save_state "$domain" "docroot_complete"
@@ -857,8 +1232,171 @@ HTML
     echo ""
 }
 
+cmd_add_git() {
+    local domain="${1:-}"
+    
+    if [[ -z "$domain" ]]; then
+        fatal "Usage: sitectl add-git <domain>"
+    fi
+    
+    # Normalize domain
+    domain="${domain,,}"
+    domain="${domain%.}"
+    
+    # Validate domain name
+    validate_domain "$domain"
+    
+    check_root "add-git $domain"
+    
+    # Check if site exists (Apache config present)
+    if [[ ! -f "/etc/apache2/sites-available/${domain}.conf" ]]; then
+        fatal "Site ${domain} does not exist. Use 'sitectl add ${domain}' to create it first."
+    fi
+    
+    local docroot="/var/www/${domain}"
+    
+    if [[ ! -d "$docroot" ]]; then
+        fatal "Document root ${docroot} does not exist"
+    fi
+    
+    # Acquire lock
+    acquire_lock "$domain"
+    CURRENT_DOMAIN="$domain"
+    
+    echo ""
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  ${BOLD}Adding Git integration to: ${GREEN}${domain}${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # Check if .git already exists
+    local has_git=false
+    if [[ -d "$docroot/.git" ]]; then
+        has_git=true
+        info "Git repository already exists in ${docroot}"
+    fi
+    
+    # Prompt for repository URL and slug
+    local repo_url slug
+    repo_url=$(prompt_for_repo_url)
+    slug=$(prompt_for_slug "$domain")
+    
+    echo ""
+    
+    # Create Linux user if it doesn't exist
+    if ! user_exists "site_${slug}"; then
+        info "Creating Linux user for site..."
+        create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
+    else
+        # User exists - verify home directory matches
+        local existing_home
+        existing_home=$(getent passwd "site_${slug}" | cut -d: -f6)
+        if [[ "$existing_home" != "$docroot" ]]; then
+            warn "User site_${slug} exists with different home directory: ${existing_home}"
+            warn "Expected: ${docroot}"
+            if ! confirm "Continue anyway?"; then
+                info "Aborted."
+                return 0
+            fi
+        else
+            info "User site_${slug} already exists with correct home directory"
+        fi
+    fi
+    
+    # Handle repository setup
+    if [[ "$has_git" == "true" ]]; then
+        # Just register with site-pull, don't clone
+        info "Repository already exists, registering with site-pull..."
+        update_site_pull "$domain" "$slug" || warn "Failed to update site-pull"
+    else
+        # Need to clone - backup existing files first
+        if [[ -n "$(ls -A "$docroot" 2>/dev/null)" ]]; then
+            echo ""
+            warn "Document root contains existing files"
+            echo ""
+            
+            if ! confirm "Clone will replace existing content. Backup first?"; then
+                info "Aborted."
+                return 0
+            fi
+            
+            # Create backup
+            local backup_dir="/var/backups/sitectl/${domain}-$(date +%Y%m%d-%H%M%S)"
+            info "Creating backup at ${backup_dir}..."
+            install -d -m 755 "$(dirname "$backup_dir")"
+            cp -a "$docroot" "$backup_dir"
+            success "Backup created"
+            
+            # Remove existing files
+            info "Removing existing files from ${docroot}..."
+            # Safety check: ensure docroot starts with /var/www/
+            if [[ "$docroot" == /var/www/* && -d "$docroot" ]]; then
+                rm -rf "${docroot:?}"/*
+            else
+                error "Invalid document root path: ${docroot}"
+                return 1
+            fi
+        fi
+        
+        # Clone repository
+        local temp_clone
+        temp_clone=$(mktemp -d) || {
+            error "Failed to create temporary directory"
+            fatal "Failed to clone repository"
+        }
+        
+        if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
+            info "Moving repository contents to ${docroot}..."
+            # Use rsync for safer file transfer
+            if command_exists rsync; then
+                if ! rsync -a --remove-source-files "$temp_clone/" "$docroot/"; then
+                    rm -rf "$temp_clone" 2>/dev/null || true
+                    fatal "Failed to copy repository contents"
+                fi
+                rm -rf "$temp_clone"
+            else
+                # Fallback to mv/cp
+                shopt -s dotglob
+                if ! mv "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                    if cp -a "$temp_clone"/* "$docroot/" 2>/dev/null; then
+                        rm -rf "$temp_clone"
+                    else
+                        shopt -u dotglob
+                        error "Failed to move repository contents"
+                        fatal "Failed to clone repository"
+                    fi
+                fi
+                shopt -u dotglob
+                rm -rf "$temp_clone" 2>/dev/null || true
+            fi
+        else
+            rm -rf "$temp_clone" 2>/dev/null || true
+            fatal "Failed to clone repository"
+        fi
+        
+        # Update site-pull
+        update_site_pull "$domain" "$slug" || warn "Failed to update site-pull"
+    fi
+    
+    # Set permissions
+    set_site_permissions "$docroot" "$slug" || fatal "Failed to set permissions"
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  ✓ Git integration configured for: ${domain}${NC}"
+    echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${BOLD}Domain:${NC}         ${domain}"
+    echo -e "  ${BOLD}Document Root:${NC}  ${docroot}"
+    echo -e "  ${BOLD}Linux User:${NC}     site_${slug}"
+    echo -e "  ${BOLD}Repository:${NC}     ${repo_url}"
+    echo ""
+    echo -e "  ${BOLD}Deploy updates:${NC}  sudo /usr/local/bin/site-pull ${domain}"
+    echo ""
+}
+
 cmd_remove() {
-    local domain="$1"
+    local domain="${1:-}"
     
     if [[ -z "$domain" ]]; then
         fatal "Usage: sitectl remove <domain>"
@@ -1009,7 +1547,7 @@ cmd_list() {
 }
 
 cmd_status() {
-    local domain="$1"
+    local domain="${1:-}"
     
     if [[ -z "$domain" ]]; then
         fatal "Usage: sitectl status <domain>"
@@ -1330,19 +1868,37 @@ HELP
     echo ""
     echo -e "    ${CYAN}add${NC} <domain> [options]"
     echo "        Create a new site with DNS, Apache vhost, and SSL."
+    echo "        Git integration is enabled by default (prompts for repo URL and slug)."
     echo ""
     echo "        Options:"
-    echo "          --no-proxy    Disable Cloudflare proxy (orange cloud off)"
-    echo "          --skip-dns    Skip DNS setup (if already configured)"
-    echo "          --skip-ssl    Skip SSL setup (HTTP only)"
-    echo "          --wait <sec>  DNS propagation wait time (default: 180)"
-    echo "          --dry-run     Preview changes without making them"
+    echo "          --no-proxy      Disable Cloudflare proxy (orange cloud off)"
+    echo "          --skip-dns      Skip DNS setup (if already configured)"
+    echo "          --skip-ssl      Skip SSL setup (HTTP only)"
+    echo "          --wait <sec>    DNS propagation wait time (default: 180)"
+    echo "          --dry-run       Preview changes without making them"
+    echo "          --without-git   Skip Git integration (no user creation or repo clone)"
     echo ""
     echo "        Examples:"
     echo "          sudo sitectl add api.example.com"
-    echo "          sudo sitectl add example.com           # Also sets up www"
+    echo "          # Prompts for GitHub repo URL and slug, creates site_<slug> user"
+    echo ""
+    echo "          sudo sitectl add example.com --without-git"
+    echo "          # Traditional setup without Git integration"
+    echo ""
     echo "          sudo sitectl add test.example.com --no-proxy"
     echo "          sudo sitectl add example.com --dry-run # Preview only"
+    echo ""
+    echo -e "    ${CYAN}add-git${NC} <domain>"
+    echo "        Add Git integration to an existing site."
+    echo "        Creates Linux user, clones repository, updates site-pull script."
+    echo ""
+    echo "        - Prompts for GitHub repo URL (SSH format)"
+    echo "        - Prompts for slug (validates site_<slug> doesn't exist)"
+    echo "        - If .git exists: registers with site-pull (no clone)"
+    echo "        - If no .git: clones repo (backs up existing files with confirmation)"
+    echo ""
+    echo "        Example:"
+    echo "          sudo sitectl add-git api.example.com"
     echo ""
     echo -e "    ${CYAN}remove${NC} <domain>"
     echo "        Remove a site (disables Apache, deletes SSL, removes DNS)."
@@ -1408,6 +1964,47 @@ HELP
     echo "    4. Add sites:"
     echo "       sudo sitectl add yourdomain.com"
     echo ""
+    echo -e "  ${BOLD}GIT INTEGRATION${NC}"
+    echo ""
+    echo "    Git integration is enabled by default for new sites."
+    echo ""
+    echo "    Requirements:"
+    echo "      • SSH deploy key at /root/.ssh/github_account"
+    echo "      • site-pull script at /usr/local/bin/site-pull"
+    echo ""
+    echo "    When adding a site with Git:"
+    echo "      • Prompts for GitHub repository URL (SSH format)"
+    echo "      • Creates Linux user site_<slug> (e.g., site_api)"
+    echo "      • Clones repository to /var/www/<domain>"
+    echo "      • Updates site-pull script with domain mapping"
+    echo "      • Sets permissions (dirs: 2750, files: 0640)"
+    echo ""
+    echo "    Deploy updates:"
+    echo "      sudo /usr/local/bin/site-pull <domain>"
+    echo ""
+    echo "    Skip Git integration:"
+    echo "      sudo sitectl add domain.com --without-git"
+    echo ""
+    echo "    Add Git to existing site:"
+    echo "      sudo sitectl add-git domain.com"
+    echo ""
+    echo -e "  ${BOLD}SITE-PULL SCRIPT VERSIONING${NC}"
+    echo ""
+    echo "    When sitectl updates /usr/local/bin/site-pull, it automatically"
+    echo "    creates timestamped backups in /var/backups/sitectl/site-pull/"
+    echo ""
+    echo "    • Backups are created before each modification (skipped if domain already exists)"
+    echo "    • Last 10 versions are kept automatically"
+    echo "    • Automatic rollback on update failure"
+    echo ""
+    echo "    Manual rollback:"
+    echo "      # List available backups"
+    echo "      ls -lh /var/backups/sitectl/site-pull/"
+    echo ""
+    echo "      # Restore from a specific backup"
+    echo "      sudo cp /var/backups/sitectl/site-pull/site-pull.YYYYMMDD-HHMMSS-NNNNNNNNN \\"
+    echo "           /usr/local/bin/site-pull"
+    echo ""
     echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
     echo ""
     echo "    SSL fails? Try:"
@@ -1425,10 +2022,11 @@ HELP
     echo ""
     echo -e "  ${BOLD}FILES${NC}"
     echo ""
-    echo "    /etc/sitectl/config       Configuration file"
-    echo "    /etc/sitectl/state/       State files for resumable operations"
-    echo "    /var/log/sitectl.log      Log file"
-    echo "    /var/www/<domain>/        Document roots"
+    echo "    /etc/sitectl/config                Configuration file"
+    echo "    /etc/sitectl/state/                State files for resumable operations"
+    echo "    /var/log/sitectl.log               Log file"
+    echo "    /var/www/<domain>/                 Document roots"
+    echo "    /var/backups/sitectl/site-pull/    site-pull script backups"
     echo ""
 }
 
@@ -1445,6 +2043,9 @@ main() {
     case "$command" in
         add|create|new)
             cmd_add "$@"
+            ;;
+        add-git)
+            cmd_add_git "$@"
             ;;
         remove|delete|rm)
             cmd_remove "$@"
