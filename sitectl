@@ -473,7 +473,8 @@ update_site_pull() {
     fi
     
     # Check if domain already exists in site-pull
-    if grep -q "^[[:space:]]*${domain})" "$site_pull" 2>/dev/null; then
+    # Use more specific pattern to avoid matching commented lines
+    if grep -q "^[[:space:]]*${domain})[[:space:]]*OWNER=" "$site_pull" 2>/dev/null; then
         warn "Domain ${domain} already exists in site-pull, skipping update"
         return 0
     fi
@@ -484,29 +485,33 @@ update_site_pull() {
     fi
     
     # Create timestamped backup before making changes
+    # Use nanoseconds in timestamp to avoid collisions in rapid operations
     local timestamp
-    timestamp=$(date +%Y%m%d-%H%M%S)
+    timestamp=$(date +%Y%m%d-%H%M%S-%N)
     local backup_file="${SITE_PULL_BACKUP_DIR}/site-pull.${timestamp}"
     
-    if [[ -d "$SITE_PULL_BACKUP_DIR" ]]; then
-        if cp -p "$site_pull" "$backup_file" 2>/dev/null; then
-            success "Created backup: ${backup_file}"
-        else
-            warn "Failed to create backup, continuing anyway"
-        fi
+    # Attempt backup creation (simplified - just try the copy)
+    if cp -p "$site_pull" "$backup_file" 2>/dev/null; then
+        success "Created backup: ${backup_file}"
+    else
+        warn "Failed to create backup, continuing anyway"
+        backup_file=""  # Clear backup_file if backup failed
     fi
     
     # Find the case statement and add new mapping before the default case
     # Look for the line with the *) pattern (default case)
+    # Use portable [[:space:]] instead of \s
     local line_num
-    line_num=$(grep -n '^\s*\*)' "$site_pull" | head -1 | cut -d: -f1)
+    line_num=$(grep -n '^[[:space:]]*\*)' "$site_pull" | head -1 | cut -d: -f1)
     
     if [[ -z "$line_num" ]]; then
         error "Could not find default case in site-pull script"
         # Restore from backup if it exists
-        if [[ -f "$backup_file" ]]; then
+        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
             warn "Restoring from backup..."
             cp -p "$backup_file" "$site_pull"
+        else
+            warn "No backup available for rollback"
         fi
         return 1
     fi
@@ -516,13 +521,15 @@ update_site_pull() {
     if ! sed -i "${line_num}i\\${new_entry}" "$site_pull"; then
         error "Failed to update site-pull script"
         # Restore from backup if it exists
-        if [[ -f "$backup_file" ]]; then
+        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
             warn "Restoring from backup..."
             if cp -p "$backup_file" "$site_pull"; then
                 success "Successfully restored site-pull from backup"
             else
                 error "Failed to restore from backup"
             fi
+        else
+            warn "No backup available for rollback"
         fi
         return 1
     fi
@@ -1972,7 +1979,7 @@ HELP
     echo "    When sitectl updates /usr/local/bin/site-pull, it automatically"
     echo "    creates timestamped backups in /var/backups/sitectl/site-pull/"
     echo ""
-    echo "    • Backups are created before each modification"
+    echo "    • Backups are created before each modification (skipped if domain already exists)"
     echo "    • Last 10 versions are kept automatically"
     echo "    • Automatic rollback on update failure"
     echo ""

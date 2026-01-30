@@ -275,7 +275,7 @@ For Git integration to work, you need:
 
 sitectl automatically versions the `/usr/local/bin/site-pull` script to allow easy rollback if issues occur:
 
-- **Automatic Backup**: Before each modification, a timestamped backup is created in `/var/backups/sitectl/site-pull/`
+- **Automatic Backup**: Before each modification (skipped if the domain already exists), a timestamped backup is created in `/var/backups/sitectl/site-pull/`
 - **Backup Format**: `site-pull.YYYYMMDD-HHMMSS` (e.g., `site-pull.20260130-143025`)
 - **Automatic Cleanup**: Last 10 backups are kept; older ones are automatically removed
 - **Automatic Rollback**: If an update fails, the previous version is automatically restored
