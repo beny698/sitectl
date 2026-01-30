@@ -1348,7 +1348,11 @@ cmd_add_git() {
             info "Moving repository contents to ${docroot}..."
             # Use rsync for safer file transfer
             if command_exists rsync; then
-                rsync -a --remove-source-files "$temp_clone/" "$docroot/" && rm -rf "$temp_clone"
+                if ! rsync -a --remove-source-files "$temp_clone/" "$docroot/"; then
+                    rm -rf "$temp_clone" 2>/dev/null || true
+                    fatal "Failed to copy repository contents"
+                fi
+                rm -rf "$temp_clone"
             else
                 # Fallback to mv/cp
                 shopt -s dotglob
