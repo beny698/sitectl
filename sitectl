@@ -1988,7 +1988,7 @@ HELP
     echo "      ls -lh /var/backups/sitectl/site-pull/"
     echo ""
     echo "      # Restore from a specific backup"
-    echo "      sudo cp /var/backups/sitectl/site-pull/site-pull.YYYYMMDD-HHMMSS \\"
+    echo "      sudo cp /var/backups/sitectl/site-pull/site-pull.YYYYMMDD-HHMMSS-NNNNNNNNN \\"
     echo "           /usr/local/bin/site-pull"
     echo ""
     echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
