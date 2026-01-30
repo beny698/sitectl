@@ -59,7 +59,13 @@ TLS_EMAIL="you@example.com"
 
 # Optional: DNS propagation wait time in seconds (default: 180)
 DNS_WAIT_SECONDS=180
+
+# Optional: Server IP addresses (auto-detected if not set)
+# SERVER_IPV4="1.2.3.4"
+# SERVER_IPV6="2001:db8::1"
 ```
+
+**Note**: Server IPs are auto-detected by default. Only set `SERVER_IPV4` or `SERVER_IPV6` if auto-detection doesn't work in your environment.
 
 ### 3. Add Your First Site
 
