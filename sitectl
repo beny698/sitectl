@@ -496,6 +496,7 @@ cmd_add() {
     local skip_dns=false
     local skip_ssl=false
     local wait_time="${DNS_WAIT_SECONDS:-180}"
+    local dry_run=false
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -516,6 +517,10 @@ cmd_add() {
                 wait_time="$2"
                 shift 2
                 ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
             -*)
                 fatal "Unknown option: $1"
                 ;;
@@ -531,7 +536,7 @@ cmd_add() {
     done
     
     if [[ -z "$domain" ]]; then
-        fatal "Usage: sitectl add <domain> [--no-proxy] [--skip-dns] [--skip-ssl] [--wait <seconds>]"
+        fatal "Usage: sitectl add <domain> [--no-proxy] [--skip-dns] [--skip-ssl] [--wait <seconds>] [--dry-run]"
     fi
     
     # Normalize domain (lowercase, no trailing dot)
@@ -573,6 +578,41 @@ cmd_add() {
     if [[ "$no_proxy" == "true" ]]; then
         proxied="false"
         info "Cloudflare proxy disabled for this site"
+    fi
+    
+    # Handle dry-run mode
+    if [[ "$dry_run" == "true" ]]; then
+        local ipv4 ipv6
+        ipv4=$(get_ipv4)
+        ipv6=$(get_ipv6)
+        
+        if [[ -z "$ipv4" ]]; then
+            warn "Could not detect server IPv4 address"
+            ipv4="<server-ipv4>"
+        fi
+        
+        echo ""
+        echo -e "${BOLD}${CYAN}Dry Run: What would happen for ${domain}${NC}"
+        echo ""
+        echo "DNS Changes:"
+        echo "  • Would create/update A record: ${domain} -> ${ipv4}"
+        [[ -n "$ipv6" ]] && echo "  • Would create/update AAAA record: ${domain} -> ${ipv6}"
+        [[ "$is_sub" == "false" ]] && echo "  • Would create/update A record: www.${domain} -> ${ipv4}"
+        [[ "$is_sub" == "false" && -n "$ipv6" ]] && echo "  • Would create/update AAAA record: www.${domain} -> ${ipv6}"
+        echo ""
+        echo "Files to create:"
+        echo "  • Document root: ${docroot}"
+        echo "  • Apache HTTP config: /etc/apache2/sites-available/${domain}.conf"
+        [[ "$skip_ssl" == "false" ]] && echo "  • Apache HTTPS config: /etc/apache2/sites-available/${domain}-ssl.conf"
+        echo ""
+        echo "SSL Certificate:"
+        if [[ "$skip_ssl" == "false" ]]; then
+            echo "  • Would request certificate for: ${domain}$([[ "$is_sub" == "false" ]] && echo ", www.${domain}")"
+        else
+            echo "  • SSL skipped (--skip-ssl)"
+        fi
+        echo ""
+        exit 0
     fi
     
     # Check current state for resume capability
@@ -1177,12 +1217,21 @@ CONFIG
     local script_path
     script_path="$(readlink -f "$0")"
     
-    if [[ "$script_path" != "/usr/local/bin/sitectl" ]]; then
+    if [[ -f /usr/local/bin/sitectl ]]; then
+        local installed_version
+        installed_version=$(/usr/local/bin/sitectl version 2>/dev/null | grep -oP 'v[\d.]+' || echo "unknown")
+        if [[ "$installed_version" == "v${VERSION}" ]]; then
+            info "sitectl v${VERSION} is already installed"
+        else
+            info "Upgrading sitectl from ${installed_version} to v${VERSION}"
+            cp "$script_path" /usr/local/bin/sitectl
+            chmod 755 /usr/local/bin/sitectl
+            success "Upgraded sitectl to v${VERSION}"
+        fi
+    else
         cp "$script_path" /usr/local/bin/sitectl
         chmod 755 /usr/local/bin/sitectl
         success "Installed sitectl to /usr/local/bin/sitectl"
-    else
-        info "sitectl already installed in /usr/local/bin"
     fi
     
     # Set up certbot renewal hook
@@ -1248,11 +1297,13 @@ HELP
     echo "          --skip-dns    Skip DNS setup (if already configured)"
     echo "          --skip-ssl    Skip SSL setup (HTTP only)"
     echo "          --wait <sec>  DNS propagation wait time (default: 180)"
+    echo "          --dry-run     Preview changes without making them"
     echo ""
     echo "        Examples:"
     echo "          sudo sitectl add api.example.com"
     echo "          sudo sitectl add example.com           # Also sets up www"
     echo "          sudo sitectl add test.example.com --no-proxy"
+    echo "          sudo sitectl add example.com --dry-run # Preview only"
     echo ""
     echo -e "    ${CYAN}remove${NC} <domain>"
     echo "        Remove a site (disables Apache, deletes SSL, removes DNS)."
@@ -1343,8 +1394,8 @@ HELP
 # ==================== MAIN ====================
 
 main() {
-    # Ensure log directory exists
-    install -d -m 755 "$(dirname "$LOG_FILE")"
+    # Ensure log directory exists (silently fail if not root)
+    install -d -m 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
     touch "$LOG_FILE" 2>/dev/null || true
     
     local command="${1:-help}"
