@@ -371,7 +371,25 @@ create_site_user() {
         error "Failed to add ${username} to www-data group"
         return 1
     }
-    
+
+    # Add www-data to the site user's group so Apache can read/write files
+    usermod -aG "$username" www-data || {
+        error "Failed to add www-data to ${username} group"
+        return 1
+    }
+
+    # Add ben to the site user's group for direct file access
+    usermod -aG "$username" ben || {
+        error "Failed to add ben to ${username} group"
+        return 1
+    }
+
+    # Restart Apache to pick up the group changes
+    systemctl restart apache2 || {
+        error "Failed to restart apache2"
+        return 1
+    }
+
     success "Created user ${username} (home: ${docroot})"
     return 0
 }
