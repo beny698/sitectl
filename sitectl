@@ -82,7 +82,7 @@ fatal() {
 confirm() {
     local prompt="$1"
     local response
-    echo -en "${YELLOW}${prompt}${NC} [y/N] "
+    echo -en "${YELLOW}${prompt}${NC} [y/N] " >&2
     read -r response
     [[ "$response" =~ ^[Yy]$ ]]
 }
@@ -331,7 +331,7 @@ prompt_for_slug() {
     
     local slug
     while true; do
-        echo -en "${CYAN}Enter slug for Linux user${NC} [${default_slug}]: "
+        echo -en "${CYAN}Enter slug for Linux user${NC} [${default_slug}]: " >&2
         read -r slug
         
         # Use default if empty
@@ -559,7 +559,7 @@ update_site_pull() {
 prompt_for_repo_url() {
     local repo_url
     while true; do
-        echo -en "${CYAN}Enter GitHub repository URL (SSH format)${NC}: "
+        echo -en "${CYAN}Enter GitHub repository URL (SSH format)${NC}: " >&2
         read -r repo_url
         
         # Validate SSH format
