@@ -347,14 +347,38 @@ prompt_for_slug() {
     done
 }
 
+# Prompt for additional user to grant file access
+prompt_for_additional_user() {
+    local additional_user
+    while true; do
+        echo -en "${CYAN}Enter additional user to grant file access${NC}: " >&2
+        read -r additional_user
+
+        if [[ -z "$additional_user" ]]; then
+            error "User cannot be empty"
+            continue
+        fi
+
+        # Check if user exists
+        if ! user_exists "$additional_user"; then
+            error "User '$additional_user' does not exist"
+            continue
+        fi
+
+        echo "$additional_user"
+        return 0
+    done
+}
+
 # Create Linux user for site
 create_site_user() {
     local slug="$1"
     local docroot="$2"
+    local additional_user="$3"
     local username="site_${slug}"
-    
+
     info "Creating Linux user: ${username}"
-    
+
     # Create user with home directory at docroot, no login shell
     local useradd_args=(-r -d "$docroot" -s /usr/sbin/nologin -c "Site user for ${slug}")
     # Only request home directory creation if it does not already exist
@@ -365,7 +389,7 @@ create_site_user() {
         error "Failed to create user ${username}"
         return 1
     }
-    
+
     # Add user to www-data group for Apache access
     usermod -a -G www-data "$username" || {
         error "Failed to add ${username} to www-data group"
@@ -378,9 +402,9 @@ create_site_user() {
         return 1
     }
 
-    # Add ben to the site user's group for direct file access
-    usermod -aG "$username" ben || {
-        error "Failed to add ben to ${username} group"
+    # Add the additional user to the site user's group for direct file access
+    usermod -aG "$username" "$additional_user" || {
+        error "Failed to add ${additional_user} to ${username} group"
         return 1
     }
 
@@ -1023,15 +1047,16 @@ cmd_add() {
         if [[ "$with_git" == "true" ]]; then
             info "Step 2/4: Setting up document root with Git integration..."
             
-            # Prompt for Git repository and slug
+            # Prompt for Git repository, slug, and additional user
             echo ""
-            local repo_url slug
+            local repo_url slug additional_user
             repo_url=$(prompt_for_repo_url)
             slug=$(prompt_for_slug "$domain")
+            additional_user=$(prompt_for_additional_user)
             echo ""
-            
+
             # Create Linux user (will create home directory at docroot)
-            create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
+            create_site_user "$slug" "$docroot" "$additional_user" || fatal "Failed to create site user"
             
             # Remove placeholder index.html if it exists
             rm -f "$docroot/index.html" 2>/dev/null || true
@@ -1294,17 +1319,18 @@ cmd_add_git() {
         info "Git repository already exists in ${docroot}"
     fi
     
-    # Prompt for repository URL and slug
-    local repo_url slug
+    # Prompt for repository URL, slug, and additional user
+    local repo_url slug additional_user
     repo_url=$(prompt_for_repo_url)
     slug=$(prompt_for_slug "$domain")
-    
+    additional_user=$(prompt_for_additional_user)
+
     echo ""
-    
+
     # Create Linux user if it doesn't exist
     if ! user_exists "site_${slug}"; then
         info "Creating Linux user for site..."
-        create_site_user "$slug" "$docroot" || fatal "Failed to create site user"
+        create_site_user "$slug" "$docroot" "$additional_user" || fatal "Failed to create site user"
     else
         # User exists - verify home directory matches
         local existing_home
