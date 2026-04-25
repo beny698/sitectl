@@ -140,10 +140,10 @@ load_config() {
 # Validate SITE_OWNER is configured and the user exists on the system
 require_site_owner() {
     if [[ -z "${SITE_OWNER:-}" ]]; then
-        fatal "SITE_OWNER not configured in $CONFIG_FILE\nRun 'sudo sitectl install' to set the site owner."
+        fatal "SITE_OWNER not configured in $CONFIG_FILE. Run 'sudo sitectl install' to set the site owner."
     fi
     if ! id "$SITE_OWNER" &>/dev/null; then
-        fatal "SITE_OWNER user '${SITE_OWNER}' does not exist on this system.\nCreate the user first: sudo useradd ${SITE_OWNER}"
+        fatal "SITE_OWNER user '${SITE_OWNER}' does not exist on this system. Create the user first: sudo useradd ${SITE_OWNER}"
     fi
 }
 
@@ -1662,7 +1662,7 @@ cmd_install() {
         fi
         
         if ! id "$site_owner_input" &>/dev/null; then
-            fatal "User '${site_owner_input}' does not exist on this system.\nCreate the user first: sudo useradd ${site_owner_input}\nThen run install again."
+            fatal "User '${site_owner_input}' does not exist on this system. Create the user first: sudo useradd ${site_owner_input} -- then run install again."
         fi
         
         echo ""
