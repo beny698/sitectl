@@ -1,6 +1,6 @@
 # sitectl
 
-A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP servers with automatic Cloudflare DNS and Let’s Encrypt SSL configuration.
+A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP servers with automatic Cloudflare DNS and Let's Encrypt SSL configuration.
 
 ```
   ███████╗██╗████████╗███████╗ ██████╗████████╗██╗     
@@ -16,22 +16,23 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 - **One-command site setup** - DNS, Apache vhost, and SSL in a single command
 - **Git integration** - Automatically clone GitHub repositories and set up deployment workflow (enabled by default)
 - **Cloudflare DNS integration** - Automatically creates/updates A and AAAA records
-- **Let’s Encrypt SSL** - Uses DNS-01 challenge via Cloudflare (works even before DNS propagates publicly)
+- **Let's Encrypt SSL** - Uses DNS-01 challenge via Cloudflare (works even before DNS propagates publicly)
 - **IPv4 + IPv6 support** - Auto-detects and configures both
 - **Smart domain handling**:
-  - Subdomains: `api.example.com` → detects `example.com` zone automatically
-  - Root domains: `example.com` → also configures `www.example.com` with redirect
+  - Subdomains: `api.example.com` -> detects `example.com` zone automatically
+  - Root domains: `example.com` -> also configures `www.example.com` with redirect
 - **Cloudflare proxy** - Enabled by default (orange cloud), optional `--no-proxy` flag
 - **Resumable operations** - If setup fails midway, just run again to continue
 - **Safe removal** - Cleans up DNS, SSL, and Apache but preserves your files
 - **Preview mode** - Use `--dry-run` to see what changes would be made without executing them
 - **Security hardened** - Safe config parsing, domain validation, and concurrency protection
 - **Concurrent execution protection** - Lock files prevent multiple operations on the same domain
+- **Consistent permissions** - All site files are owned by `SITE_OWNER:www-data` with fixed modes (dirs `2750`, files `0640`)
 
 ## Requirements
 
 - Ubuntu/Debian server with Apache
-- Cloudflare account managing your domain’s DNS
+- Cloudflare account managing your domain's DNS
 - Cloudflare API token with `Zone:Read` and `DNS:Edit` permissions
 
 ## Quick Start
@@ -42,19 +43,26 @@ A command-line tool for managing Apache virtual hosts on Ubuntu/Debian LAMP serv
 # Download the script
 curl -O https://raw.githubusercontent.com/beny698/sitectl/main/sitectl
 
-# Run the installer (installs dependencies, creates config)
+# Run the installer (prompts for site owner, installs dependencies, creates config)
 sudo bash sitectl install
 ```
 
+During install you will be prompted for `SITE_OWNER` — the Linux user that will own all website files. This user must already exist on the system. If the user does not exist, the installer will exit with a clear error.
+
+**Reinstalling** (upgrading an existing install) preserves the existing `/etc/sitectl/config` unchanged.
+
 ### 2. Configure
 
-Edit `/etc/sitectl/config` with your Cloudflare API token and email:
+Edit `/etc/sitectl/config` to add your Cloudflare API token and email:
 
 ```bash
 sudo nano /etc/sitectl/config
 ```
 
 ```bash
+# Site owner: Linux user that owns all site files (set during install)
+SITE_OWNER="ben"
+
 # Cloudflare API Token (Zone:Read, DNS:Edit permissions)
 CF_TOKEN="your_cloudflare_api_token_here"
 
@@ -69,7 +77,7 @@ DNS_WAIT_SECONDS=180
 # SERVER_IPV6="2001:db8::1"
 ```
 
-**Note**: Server IPs are auto-detected by default. Only set `SERVER_IPV4` or `SERVER_IPV6` if auto-detection doesn't work in your environment.
+**Note**: Server IPs are auto-detected by default. Only set `SERVER_IPV4` or `SERVER_IPV6` if auto-detection does not work in your environment.
 
 ### 3. Add Your First Site
 
@@ -77,30 +85,48 @@ DNS_WAIT_SECONDS=180
 sudo sitectl add yourdomain.com
 ```
 
-That’s it! Your site is now live at `https://yourdomain.com` with:
+That's it! Your site is now live at `https://yourdomain.com` with:
 
 - Cloudflare DNS configured (A + AAAA records, proxy enabled)
 - Apache virtual host running
-- Valid SSL certificate from Let’s Encrypt
-- Automatic HTTP → HTTPS redirect
-- www → non-www redirect (for root domains)
+- Valid SSL certificate from Let's Encrypt
+- Automatic HTTP -> HTTPS redirect
+- www -> non-www redirect (for root domains)
+- All files owned by `SITE_OWNER:www-data`, directories `2750`, files `0640`
+
+## Permissions
+
+sitectl applies a fixed, consistent permission model to every site it manages:
+
+| What           | Value                      |
+|----------------|----------------------------|
+| Owner          | `SITE_OWNER` (from config) |
+| Group          | `www-data` (always fixed)  |
+| Directory mode | `2750` (setgid, rwxr-x---) |
+| File mode      | `0640` (rw-r-----)         |
+
+Permissions are enforced automatically at the end of every `sitectl add` (both git and non-git flows) and `sitectl add-git`.
+
+The setgid bit (`2` in `2750`) ensures new files created inside site directories automatically inherit the `www-data` group.
+
+No per-site Linux users are created. All sites are owned by the single `SITE_OWNER` configured at install time.
 
 ## Commands
 
 ### `sitectl add <domain> [options]`
 
-Create a new site with DNS, Apache, and SSL. **Git integration is enabled by default** - you'll be prompted for GitHub repository URL and slug.
+Create a new site with DNS, Apache, and SSL. **Git integration is enabled by default** - you'll be prompted for a GitHub repository URL.
 
 ```bash
 # Add a subdomain with Git integration (default)
 sudo sitectl add api.example.com
-# Prompts for: GitHub repo URL, slug (suggests "api")
-# Creates: site_api user, clones repo, updates site-pull
+# Prompts for: GitHub repo URL
+# Clones repo, sets SITE_OWNER:www-data ownership, dirs 2750, files 0640
 
 # Add a root domain (also configures www)
 sudo sitectl add example.com
 
-# Skip Git integration
+# Skip Git integration (creates placeholder index.html)
 sudo sitectl add api.example.com --without-git
 
 # Disable Cloudflare proxy (direct connection)
@@ -121,12 +147,11 @@ sudo sitectl add example.com --dry-run
 
 ### `sitectl add-git <domain>`
 
-Add Git integration to an existing site.
+Add Git integration to an existing site. Prompts for a GitHub repository URL, clones the repository (or registers an existing `.git`), updates `/usr/local/bin/site-pull`, and enforces `SITE_OWNER:www-data` ownership and permissions.
 
 ```bash
 sudo sitectl add-git oldsite.example.com
-# Prompts for: GitHub repo URL, slug
-# Creates: Linux user, clones/registers repo, updates site-pull
+# Prompts for: GitHub repo URL (SSH format)
 ```
 
 ### `sitectl remove <domain>`
@@ -153,7 +178,7 @@ Show all configured sites with their status.
 
 ```
   DOMAIN                              HTTP       HTTPS      SSL EXPIRY
-  ─────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------
   api.example.com                     enabled    enabled    2025-04-15
   example.com                         enabled    enabled    2025-04-10
 ```
@@ -176,11 +201,14 @@ sudo sitectl status api.example.com
 
 First-time setup on a new server:
 
+- **Prompts for `SITE_OWNER`** (required) - the Linux user that will own all site files. Must exist on the system; installer exits with a clear error if the user is not found.
 - Installs dependencies (apache2, certbot, python3-certbot-dns-cloudflare, curl, jq)
 - Enables required Apache modules (ssl, headers, rewrite, http2)
-- Creates configuration file
+- Creates `/etc/sitectl/config` (includes `SITE_OWNER`)
 - Sets up certbot renewal hooks
 - Installs sitectl to `/usr/local/bin/`
+
+**Reinstalling** preserves the existing `/etc/sitectl/config` without overwriting it.
 
 ```bash
 sudo bash sitectl install
@@ -192,7 +220,7 @@ Display full documentation.
 
 ## Git Integration
 
-sitectl includes built-in Git integration for automatic repository deployment. When enabled (default), it creates a Linux user, clones your GitHub repository, and integrates with the site-pull deployment script.
+sitectl includes built-in Git integration for automatic repository deployment. When enabled (default), it clones your GitHub repository and integrates with the site-pull deployment script.
 
 ### Quick Start with Git
 
@@ -200,16 +228,15 @@ sitectl includes built-in Git integration for automatic repository deployment. W
 # Add a new site with Git integration (default behavior)
 sudo sitectl add api.example.com
 
-# You'll be prompted for:
+# You will be prompted for:
 # - GitHub repository URL (SSH format): git@github.com:user/repo.git
-# - Slug for Linux user (default suggested): api
 ```
 
 This automatically:
-1. Creates Linux user `site_api` with home directory at `/var/www/api.example.com`
+1. Creates document root at `/var/www/api.example.com`
 2. Clones your repository into the document root
-3. Updates `/usr/local/bin/site-pull` with domain mapping
-4. Sets permissions (directories: 2750, files: 0640)
+3. Updates `/usr/local/bin/site-pull` with domain mapping (owner: `SITE_OWNER`)
+4. Enforces ownership `SITE_OWNER:www-data`, directories `2750`, files `0640`
 
 ### Deploy Updates
 
@@ -219,8 +246,6 @@ After making changes to your repository:
 sudo /usr/local/bin/site-pull api.example.com
 ```
 
-This pulls the latest code from GitHub and sets the correct permissions.
-
 ### Add Git to Existing Site
 
 For sites created without Git integration:
@@ -229,11 +254,11 @@ For sites created without Git integration:
 sudo sitectl add-git oldsite.example.com
 ```
 
-You'll be prompted for the repository URL and slug. If the site already has a `.git` directory, it will just register with site-pull without cloning.
+You will be prompted for the repository URL. If the site already has a `.git` directory, it will just register with site-pull without cloning.
 
 ### Skip Git Integration
 
-To create a site without Git integration (traditional behavior):
+To create a site without Git integration (placeholder `index.html`):
 
 ```bash
 sudo sitectl add example.com --without-git
@@ -245,31 +270,11 @@ For Git integration to work, you need:
 
 1. **SSH Deploy Key** - Located at `/root/.ssh/github_account`
    - Generate with: `ssh-keygen -t ed25519 -f /root/.ssh/github_account -C "deploy@yourserver"`
-   - Add the public key to your GitHub repository: Settings → Deploy keys → Add deploy key
+   - Add the public key to your GitHub repository: Settings -> Deploy keys -> Add deploy key
 
 2. **site-pull Script** - Located at `/usr/local/bin/site-pull`
    - This script handles deployment and permission management
    - sitectl automatically updates it with new domain mappings
-
-### How It Works
-
-1. **Linux User**: Each site gets a dedicated user `site_<slug>` (e.g., `site_api`)
-   - User is added to `www-data` group for Apache access
-   - Home directory is the site's document root
-
-2. **Repository Clone**: Uses SSH with the deploy key
-   - Environment: `GIT_SSH_COMMAND="ssh -i /root/.ssh/github_account"`
-   - Clones directly into `/var/www/<domain>/`
-
-3. **site-pull Integration**: Adds domain mapping to the case statement
-   ```bash
-   api.example.com) OWNER="site_api" ;;
-   ```
-
-4. **Permissions**: Matches site-pull script
-   - Directories: `chmod 2750` (setgid for group inheritance)
-   - Files: `chmod 0640` (readable by owner and group)
-   - Owner: `site_<slug>:site_<slug>`
 
 ### site-pull Script Versioning
 
@@ -293,15 +298,6 @@ sudo cp /var/backups/sitectl/site-pull/site-pull.20260130-143025-123456789 \
      /usr/local/bin/site-pull
 ```
 
-### Slug Naming
-
-The slug determines the Linux username (`site_<slug>`):
-
-- Subdomains: First part is suggested (e.g., `api.example.com` → `api`)
-- Root domains: Domain name is suggested (e.g., `example.com` → `example`)
-- Must be unique (validated against existing users)
-- Alphanumeric, hyphens, and underscores only
-
 ## Creating a Cloudflare API Token
 
 1. Go to [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)
@@ -311,7 +307,7 @@ The slug determines the Linux username (`site_<slug>`):
 - `Zone - Zone - Read`
 - `Zone - DNS - Edit`
 1. Zone Resources: `Include - All Zones` (or select specific zones)
-1. Click **Continue to summary** → **Create Token**
+1. Click **Continue to summary** -> **Create Token**
 1. Copy the token to your `/etc/sitectl/config`
 
 ## File Locations
@@ -355,6 +351,14 @@ tail -f /var/log/sitectl.log
 - Ensure the zone is active in Cloudflare
 - Check that the root domain is correct (e.g., `example.com` not `www.example.com`)
 
+### SITE_OWNER user not found
+
+If `sitectl add` (or `sitectl add-git`) fails with a message about `SITE_OWNER` not existing:
+
+1. Verify the user is set correctly in `/etc/sitectl/config`
+2. Confirm the user exists: `id <username>`
+3. Create the user if needed, then retry the command
+
 ### Resume a failed setup
 
 Just run the same `add` command again. sitectl tracks progress and will skip completed steps:
@@ -374,12 +378,13 @@ sudo sitectl status example.com
 
 ## How It Works
 
-1. **DNS Setup**: Uses Cloudflare API to create/update A and AAAA records pointing to your server’s public IPs (auto-detected). Enables Cloudflare proxy by default.
-1. **Document Root**: Creates `/var/www/<domain>/` with a placeholder index.html.
+1. **DNS Setup**: Uses Cloudflare API to create/update A and AAAA records pointing to your server's public IPs (auto-detected). Enables Cloudflare proxy by default.
+1. **Document Root**: Creates `/var/www/<domain>/` with a placeholder index.html (non-git sites) or clones your repository (git sites).
 1. **Apache HTTP**: Creates and enables a virtual host on port 80 with HTTPS redirect.
 1. **DNS Propagation Wait**: Waits 3 minutes (configurable) for DNS to propagate.
-1. **SSL Certificate**: Uses certbot with DNS-01 challenge via Cloudflare to obtain a Let’s Encrypt certificate. This method works even if HTTP isn’t publicly accessible yet.
+1. **SSL Certificate**: Uses certbot with DNS-01 challenge via Cloudflare to obtain a Let's Encrypt certificate. This method works even if HTTP isn't publicly accessible yet.
 1. **Apache HTTPS**: Creates and enables a virtual host on port 443 with security headers.
+1. **Permissions**: Recursively sets ownership to `SITE_OWNER:www-data`, directories to `2750`, and files to `0640`.
 
 ## License
 
