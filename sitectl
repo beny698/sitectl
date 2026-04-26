@@ -112,6 +112,7 @@ load_config() {
         value="${value%\'}"
         
         case "$key" in
+            SITE_OWNER) SITE_OWNER="$value" ;;
             CF_TOKEN) CF_TOKEN="$value" ;;
             TLS_EMAIL) TLS_EMAIL="$value" ;;
             DNS_WAIT_SECONDS) DNS_WAIT_SECONDS="$value" ;;
@@ -133,6 +134,16 @@ load_config() {
         if ! [[ "$DNS_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
             fatal "DNS_WAIT_SECONDS must be a positive integer in $CONFIG_FILE"
         fi
+    fi
+}
+
+# Validate SITE_OWNER is configured and the user exists on the system
+require_site_owner() {
+    if [[ -z "${SITE_OWNER:-}" ]]; then
+        fatal "SITE_OWNER not configured in $CONFIG_FILE. Run 'sudo sitectl install' to set the site owner."
+    fi
+    if ! id "$SITE_OWNER" &>/dev/null; then
+        fatal "SITE_OWNER user '${SITE_OWNER}' does not exist on this system. Create the user first: sudo useradd ${SITE_OWNER} -- then run 'sudo sitectl install' again."
     fi
 }
 
@@ -281,143 +292,6 @@ get_ipv6() {
 
 # ==================== GIT INTEGRATION HELPERS ====================
 
-# Suggest slug from domain
-# api.benmadison.dev -> api
-# benmadison.dev -> benmadison
-suggest_slug() {
-    local domain="$1"
-    local root_domain
-    root_domain=$(get_root_domain "$domain")
-    
-    # If it's a subdomain, extract the first part
-    if [[ "$domain" != "$root_domain" ]]; then
-        echo "$domain" | cut -d. -f1
-    else
-        # For root domains, use the domain name without TLD
-        echo "$domain" | cut -d. -f1
-    fi
-}
-
-# Check if Linux user exists
-user_exists() {
-    local username="$1"
-    id "$username" &>/dev/null
-}
-
-# Validate slug and check if site_<slug> user doesn't exist
-validate_slug() {
-    local slug="$1"
-    
-    # Validate slug format (alphanumeric, hyphens, underscores; no leading/trailing hyphens)
-    if ! [[ "$slug" =~ ^[a-z0-9_][a-z0-9_-]*[a-z0-9_]$ ]] && ! [[ "$slug" =~ ^[a-z0-9_]$ ]]; then
-        error "Invalid slug format. Use lowercase letters, numbers, hyphens (not at start/end), and underscores."
-        return 1
-    fi
-    
-    # Check if user already exists
-    if user_exists "site_${slug}"; then
-        error "User site_${slug} already exists. Choose a different slug."
-        return 1
-    fi
-    
-    return 0
-}
-
-# Prompt for slug with smart default
-prompt_for_slug() {
-    local domain="$1"
-    local default_slug
-    default_slug=$(suggest_slug "$domain")
-    
-    local slug
-    while true; do
-        echo -en "${CYAN}Enter slug for Linux user${NC} [${default_slug}]: " >&2
-        read -r slug
-        
-        # Use default if empty
-        if [[ -z "$slug" ]]; then
-            slug="$default_slug"
-        fi
-        
-        # Validate slug
-        if validate_slug "$slug"; then
-            echo "$slug"
-            return 0
-        fi
-    done
-}
-
-# Prompt for additional user to grant file access
-prompt_for_additional_user() {
-    local additional_user
-    while true; do
-        echo -en "${CYAN}Enter additional user to grant file access${NC}: " >&2
-        read -r additional_user
-
-        if [[ -z "$additional_user" ]]; then
-            error "User cannot be empty"
-            continue
-        fi
-
-        # Check if user exists
-        if ! user_exists "$additional_user"; then
-            error "User '$additional_user' does not exist"
-            continue
-        fi
-
-        echo "$additional_user"
-        return 0
-    done
-}
-
-# Create Linux user for site
-create_site_user() {
-    local slug="$1"
-    local docroot="$2"
-    local additional_user="$3"
-    local username="site_${slug}"
-
-    info "Creating Linux user: ${username}"
-
-    # Create user with home directory at docroot, no login shell
-    local useradd_args=(-r -d "$docroot" -s /usr/sbin/nologin -c "Site user for ${slug}")
-    # Only request home directory creation if it does not already exist
-    if [[ ! -d "$docroot" ]]; then
-        useradd_args+=(-m)
-    fi
-    useradd "${useradd_args[@]}" "$username" || {
-        error "Failed to create user ${username}"
-        return 1
-    }
-
-    # Add user to www-data group for Apache access
-    usermod -a -G www-data "$username" || {
-        error "Failed to add ${username} to www-data group"
-        return 1
-    }
-
-    # Add www-data to the site user's group so Apache can read/write files
-    usermod -aG "$username" www-data || {
-        error "Failed to add www-data to ${username} group"
-        return 1
-    }
-
-    # Add the additional user to the site user's group for direct file access
-    usermod -aG "$username" "$additional_user" || {
-        error "Failed to add ${additional_user} to ${username} group"
-        return 1
-    }
-
-    # Restart Apache to pick up the group changes
-    systemctl restart apache2 || {
-        error "Failed to restart apache2"
-        return 1
-    }
-
-    success "Created user ${username} (home: ${docroot})"
-    return 0
-}
-
 # Ensure GitHub host key is trusted
 ensure_github_host_key() {
     mkdir -p /root/.ssh
@@ -436,8 +310,6 @@ ensure_github_host_key() {
 clone_git_repo() {
     local repo_url="$1"
     local dest_dir="$2"
-    local slug="$3"
-    local username="site_${slug}"
     
     # Check if git is installed
     if ! command_exists git; then
@@ -475,16 +347,14 @@ clone_git_repo() {
     return 0
 }
 
-# Set permissions on document root (matching site-pull)
+# Set permissions on document root
 set_site_permissions() {
     local docroot="$1"
-    local slug="$2"
-    local username="site_${slug}"
     
     info "Setting ownership and permissions..."
     
-    # Set ownership
-    chown -R "$username:$username" "$docroot" || {
+    # Set ownership: SITE_OWNER:www-data
+    chown -R "${SITE_OWNER}:www-data" "$docroot" || {
         error "Failed to set ownership"
         return 1
     }
@@ -501,16 +371,14 @@ set_site_permissions() {
         return 1
     }
     
-    success "Permissions set (dirs: 2750, files: 0640, owner: ${username})"
+    success "Permissions set (dirs: 2750, files: 0640, owner: ${SITE_OWNER}:www-data)"
     return 0
 }
 
 # Update site-pull script with domain mapping
 update_site_pull() {
     local domain="$1"
-    local slug="$2"
     local site_pull="/usr/local/bin/site-pull"
-    local username="site_${slug}"
     
     info "Updating site-pull script..."
     
@@ -565,7 +433,7 @@ update_site_pull() {
     fi
     
     # Insert the new mapping before the default case
-    local new_entry="  ${domain}) OWNER=\"${username}\" ;;"
+    local new_entry="  ${domain}) OWNER=\"${SITE_OWNER}\" ;;"
     if ! sed -i "${line_num}i\\${new_entry}" "$site_pull"; then
         error "Failed to update site-pull script"
         # Restore from backup if it exists
@@ -593,7 +461,7 @@ update_site_pull() {
         fi
     fi
     
-    success "Added ${domain} -> ${username} mapping to site-pull"
+    success "Added ${domain} -> ${SITE_OWNER} mapping to site-pull"
     return 0
 }
 
@@ -916,7 +784,7 @@ cmd_add() {
     
     check_root "add $domain"
     load_config
-    
+
     # Acquire lock to prevent concurrent operations on the same domain
     acquire_lock "$domain"
     CURRENT_DOMAIN="$domain"
@@ -975,13 +843,17 @@ cmd_add() {
         echo ""
         echo "Git Integration:"
         if [[ "$with_git" == "true" ]]; then
-            echo "  • Would prompt for GitHub repository URL and slug"
-            echo "  • Would create Linux user: site_<slug>"
+            echo "  • Would prompt for GitHub repository URL"
             echo "  • Would clone repository to ${docroot}"
             echo "  • Would update /usr/local/bin/site-pull"
         else
             echo "  • Git integration skipped (--without-git)"
         fi
+        echo ""
+        echo "Permissions:"
+        echo "  • Owner: ${SITE_OWNER}:www-data"
+        echo "  • Directories: 2750"
+        echo "  • Files: 0640"
         echo ""
         echo "SSL Certificate:"
         if [[ "$skip_ssl" == "false" ]]; then
@@ -992,7 +864,9 @@ cmd_add() {
         echo ""
         exit 0
     fi
-    
+
+    require_site_owner
+
     # Check current state for resume capability
     local current_state
     current_state=$(get_state "$domain")
@@ -1047,17 +921,15 @@ cmd_add() {
         if [[ "$with_git" == "true" ]]; then
             info "Step 2/4: Setting up document root with Git integration..."
             
-            # Prompt for Git repository, slug, and additional user
+            # Prompt for Git repository URL
             echo ""
-            local repo_url slug additional_user
+            local repo_url
             repo_url=$(prompt_for_repo_url)
-            slug=$(prompt_for_slug "$domain")
-            additional_user=$(prompt_for_additional_user)
             echo ""
 
-            # Create Linux user (will create home directory at docroot)
-            create_site_user "$slug" "$docroot" "$additional_user" || fatal "Failed to create site user"
-            
+            # Create docroot if it doesn't exist
+            install -d -m 755 "$docroot"
+
             # Remove placeholder index.html if it exists
             rm -f "$docroot/index.html" 2>/dev/null || true
             
@@ -1069,7 +941,7 @@ cmd_add() {
                 fatal "Failed to clone repository"
             }
             
-            if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
+            if clone_git_repo "$repo_url" "$temp_clone"; then
                 # Move contents from temp to docroot
                 info "Moving repository contents to ${docroot}..."
                 # Use rsync for safer file transfer
@@ -1103,10 +975,10 @@ cmd_add() {
             fi
             
             # Update site-pull script
-            update_site_pull "$domain" "$slug" || warn "Failed to update site-pull, you may need to do this manually"
+            update_site_pull "$domain" || warn "Failed to update site-pull, you may need to do this manually"
             
-            # Set permissions
-            set_site_permissions "$docroot" "$slug" || fatal "Failed to set permissions"
+            # Set ownership and permissions
+            set_site_permissions "$docroot" || fatal "Failed to set permissions"
             
             success "Document root set up with Git integration"
         else
@@ -1139,6 +1011,9 @@ HTML
             else
                 info "Existing content found in $docroot"
             fi
+
+            # Set ownership and permissions
+            set_site_permissions "$docroot" || fatal "Failed to set permissions"
         fi
         
         save_state "$domain" "docroot_complete"
@@ -1261,6 +1136,8 @@ HTML
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "  ${BOLD}Document Root:${NC}  $docroot"
+    echo -e "  ${BOLD}Owner:${NC}          ${SITE_OWNER}:www-data"
+    echo -e "  ${BOLD}Permissions:${NC}    dirs 2750, files 0640"
     echo -e "  ${BOLD}HTTP Config:${NC}    /etc/apache2/sites-available/${domain}.conf"
     if [[ "$skip_ssl" == "false" ]]; then
         echo -e "  ${BOLD}HTTPS Config:${NC}   /etc/apache2/sites-available/${domain}-ssl.conf"
@@ -1290,6 +1167,8 @@ cmd_add_git() {
     validate_domain "$domain"
     
     check_root "add-git $domain"
+    load_config
+    require_site_owner
     
     # Check if site exists (Apache config present)
     if [[ ! -f "/etc/apache2/sites-available/${domain}.conf" ]]; then
@@ -1319,39 +1198,16 @@ cmd_add_git() {
         info "Git repository already exists in ${docroot}"
     fi
     
-    # Prompt for repository URL, slug, and additional user
-    local repo_url slug additional_user
+    # Prompt for repository URL
+    local repo_url
     repo_url=$(prompt_for_repo_url)
-    slug=$(prompt_for_slug "$domain")
-    additional_user=$(prompt_for_additional_user)
-
     echo ""
-
-    # Create Linux user if it doesn't exist
-    if ! user_exists "site_${slug}"; then
-        info "Creating Linux user for site..."
-        create_site_user "$slug" "$docroot" "$additional_user" || fatal "Failed to create site user"
-    else
-        # User exists - verify home directory matches
-        local existing_home
-        existing_home=$(getent passwd "site_${slug}" | cut -d: -f6)
-        if [[ "$existing_home" != "$docroot" ]]; then
-            warn "User site_${slug} exists with different home directory: ${existing_home}"
-            warn "Expected: ${docroot}"
-            if ! confirm "Continue anyway?"; then
-                info "Aborted."
-                return 0
-            fi
-        else
-            info "User site_${slug} already exists with correct home directory"
-        fi
-    fi
     
     # Handle repository setup
     if [[ "$has_git" == "true" ]]; then
         # Just register with site-pull, don't clone
         info "Repository already exists, registering with site-pull..."
-        update_site_pull "$domain" "$slug" || warn "Failed to update site-pull"
+        update_site_pull "$domain" || warn "Failed to update site-pull"
     else
         # Need to clone - backup existing files first
         if [[ -n "$(ls -A "$docroot" 2>/dev/null)" ]]; then
@@ -1389,7 +1245,7 @@ cmd_add_git() {
             fatal "Failed to clone repository"
         }
         
-        if clone_git_repo "$repo_url" "$temp_clone" "$slug"; then
+        if clone_git_repo "$repo_url" "$temp_clone"; then
             info "Moving repository contents to ${docroot}..."
             # Use rsync for safer file transfer
             if command_exists rsync; then
@@ -1419,11 +1275,11 @@ cmd_add_git() {
         fi
         
         # Update site-pull
-        update_site_pull "$domain" "$slug" || warn "Failed to update site-pull"
+        update_site_pull "$domain" || warn "Failed to update site-pull"
     fi
     
-    # Set permissions
-    set_site_permissions "$docroot" "$slug" || fatal "Failed to set permissions"
+    # Set ownership and permissions
+    set_site_permissions "$docroot" || fatal "Failed to set permissions"
     
     echo ""
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
@@ -1432,7 +1288,7 @@ cmd_add_git() {
     echo ""
     echo -e "  ${BOLD}Domain:${NC}         ${domain}"
     echo -e "  ${BOLD}Document Root:${NC}  ${docroot}"
-    echo -e "  ${BOLD}Linux User:${NC}     site_${slug}"
+    echo -e "  ${BOLD}Owner:${NC}          ${SITE_OWNER}:www-data"
     echo -e "  ${BOLD}Repository:${NC}     ${repo_url}"
     echo ""
     echo -e "  ${BOLD}Deploy updates:${NC}  sudo /usr/local/bin/site-pull ${domain}"
@@ -1796,9 +1652,29 @@ cmd_install() {
     install -d -m 755 /etc/sitectl
     
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<'CONFIG'
+        # Prompt for SITE_OWNER (required for new installs)
+        echo ""
+        local site_owner_input
+        echo -en "${CYAN}Enter the site owner username (SITE_OWNER)${NC}: "
+        read -r site_owner_input
+        
+        if [[ -z "$site_owner_input" ]]; then
+            fatal "SITE_OWNER cannot be empty. Create the desired user first, then run install again."
+        fi
+        
+        if ! id "$site_owner_input" &>/dev/null; then
+            fatal "User '${site_owner_input}' does not exist on this system. Create the user first: sudo useradd ${site_owner_input} -- then run install again."
+        fi
+        
+        echo ""
+        
+        cat > "$CONFIG_FILE" <<CONFIG
 # sitectl configuration
 # Edit this file with your settings
+
+# Site owner: the Linux user who owns all website files
+# Must exist on this system. Group is always www-data.
+SITE_OWNER="${site_owner_input}"
 
 # Cloudflare API Token
 # Required permissions: Zone:Read, DNS:Edit
@@ -1817,9 +1693,18 @@ DNS_WAIT_SECONDS=180
 # SERVER_IPV6="2001:db8::1"
 CONFIG
         chmod 600 "$CONFIG_FILE"
-        success "Created config file: $CONFIG_FILE"
+        success "Created config file: $CONFIG_FILE (SITE_OWNER=${site_owner_input})"
+
+        # Ensure SITE_OWNER is in the www-data group so they can access web-created files
+        if ! id -nG "$site_owner_input" | grep -qw www-data; then
+            usermod -aG www-data "$site_owner_input" && \
+                success "Added ${site_owner_input} to www-data group" || \
+                warn "Could not add ${site_owner_input} to www-data group — you may need to do this manually: sudo usermod -aG www-data ${site_owner_input}"
+        else
+            info "${site_owner_input} is already in the www-data group"
+        fi
     else
-        info "Config file already exists: $CONFIG_FILE"
+        info "Config file already exists: $CONFIG_FILE (preserved)"
     fi
     
     # Create log file
@@ -1873,10 +1758,10 @@ SH
     echo ""
     echo -e "${BOLD}Next steps:${NC}"
     echo ""
-    echo "  1. Edit the configuration file:"
+    echo "  1. Edit the configuration file to set your Cloudflare token and email:"
     echo -e "     ${CYAN}sudo nano /etc/sitectl/config${NC}"
     echo ""
-    echo "  2. Set your Cloudflare API token and email"
+    echo "  2. Set CF_TOKEN (Cloudflare API token) and TLS_EMAIL"
     echo ""
     echo "  3. Add your first site:"
     echo -e "     ${CYAN}sudo sitectl add example.com${NC}"
@@ -1912,7 +1797,7 @@ HELP
     echo ""
     echo -e "    ${CYAN}add${NC} <domain> [options]"
     echo "        Create a new site with DNS, Apache vhost, and SSL."
-    echo "        Git integration is enabled by default (prompts for repo URL and slug)."
+    echo "        Git integration is enabled by default (prompts for repo URL)."
     echo ""
     echo "        Options:"
     echo "          --no-proxy      Disable Cloudflare proxy (orange cloud off)"
@@ -1920,24 +1805,24 @@ HELP
     echo "          --skip-ssl      Skip SSL setup (HTTP only)"
     echo "          --wait <sec>    DNS propagation wait time (default: 180)"
     echo "          --dry-run       Preview changes without making them"
-    echo "          --without-git   Skip Git integration (no user creation or repo clone)"
+    echo "          --without-git   Skip Git integration (placeholder site)"
     echo ""
     echo "        Examples:"
     echo "          sudo sitectl add api.example.com"
-    echo "          # Prompts for GitHub repo URL and slug, creates site_<slug> user"
+    echo "          # Prompts for GitHub repo URL; sets ownership to SITE_OWNER:www-data"
     echo ""
     echo "          sudo sitectl add example.com --without-git"
-    echo "          # Traditional setup without Git integration"
+    echo "          # Creates placeholder site with SITE_OWNER:www-data ownership"
     echo ""
     echo "          sudo sitectl add test.example.com --no-proxy"
     echo "          sudo sitectl add example.com --dry-run # Preview only"
     echo ""
     echo -e "    ${CYAN}add-git${NC} <domain>"
     echo "        Add Git integration to an existing site."
-    echo "        Creates Linux user, clones repository, updates site-pull script."
+    echo "        Clones repository (or registers existing), updates site-pull script,"
+    echo "        and enforces SITE_OWNER:www-data ownership and permissions."
     echo ""
     echo "        - Prompts for GitHub repo URL (SSH format)"
-    echo "        - Prompts for slug (validates site_<slug> doesn't exist)"
     echo "        - If .git exists: registers with site-pull (no clone)"
     echo "        - If no .git: clones repo (backs up existing files with confirmation)"
     echo ""
@@ -1962,8 +1847,9 @@ HELP
     echo "          sudo sitectl status example.com"
     echo ""
     echo -e "    ${CYAN}install${NC}"
-    echo "        First-time setup: installs dependencies, creates config,"
-    echo "        and sets up the sitectl command."
+    echo "        First-time setup: prompts for SITE_OWNER, installs dependencies,"
+    echo "        creates config, and sets up the sitectl command."
+    echo "        Preserves existing config on reinstall."
     echo ""
     echo -e "    ${CYAN}help${NC}"
     echo "        Show this help message."
@@ -1973,6 +1859,7 @@ HELP
     echo "    Config file: /etc/sitectl/config"
     echo ""
     echo "    Required settings:"
+    echo "      SITE_OWNER       Linux user that owns all site files (prompted at install)"
     echo "      CF_TOKEN         Cloudflare API token (Zone:Read, DNS:Edit)"
     echo "      TLS_EMAIL        Email for Let's Encrypt"
     echo ""
@@ -1980,6 +1867,11 @@ HELP
     echo "      DNS_WAIT_SECONDS How long to wait for DNS propagation (default: 180)"
     echo "      SERVER_IPV4      Server IPv4 address (auto-detected if not set)"
     echo "      SERVER_IPV6      Server IPv6 address (auto-detected if not set)"
+    echo ""
+    echo "    Permissions applied to all sites:"
+    echo "      Owner:           SITE_OWNER:www-data"
+    echo "      Directories:     2750 (setgid, rwxr-x---)"
+    echo "      Files:           0640 (rw-r-----)"
     echo ""
     echo "    To edit:"
     echo "      sudo nano /etc/sitectl/config"
@@ -2018,10 +1910,9 @@ HELP
     echo ""
     echo "    When adding a site with Git:"
     echo "      • Prompts for GitHub repository URL (SSH format)"
-    echo "      • Creates Linux user site_<slug> (e.g., site_api)"
     echo "      • Clones repository to /var/www/<domain>"
-    echo "      • Updates site-pull script with domain mapping"
-    echo "      • Sets permissions (dirs: 2750, files: 0640)"
+    echo "      • Updates site-pull script with domain -> SITE_OWNER mapping"
+    echo "      • Sets ownership SITE_OWNER:www-data, dirs 2750, files 0640"
     echo ""
     echo "    Deploy updates:"
     echo "      sudo /usr/local/bin/site-pull <domain>"
