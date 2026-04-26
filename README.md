@@ -147,7 +147,7 @@ sudo sitectl add example.com --dry-run
 
 ### `sitectl add-git <domain>`
 
-Add Git integration to an existing site. Prompts for a GitHub repository URL, clones the repository (or registers an existing `.git`), updates `/usr/local/bin/site-pull`, and enforces `SITE_OWNER:www-data` ownership and permissions.
+Add Git integration to an existing site. Prompts for a GitHub repository URL, clones the repository (or uses an existing `.git`), and enforces `SITE_OWNER:www-data` ownership and permissions.
 
 ```bash
 sudo sitectl add-git oldsite.example.com
@@ -206,7 +206,8 @@ First-time setup on a new server:
 - Enables required Apache modules (ssl, headers, rewrite, http2)
 - Creates `/etc/sitectl/config` (includes `SITE_OWNER`)
 - Sets up certbot renewal hooks
-- Installs sitectl to `/usr/local/bin/`
+- Installs sitectl to `/usr/local/bin/sitectl`
+- Installs the site-pull deployment script to `/usr/local/bin/site-pull`
 
 **Reinstalling** preserves the existing `/etc/sitectl/config` without overwriting it.
 
@@ -235,16 +236,21 @@ sudo sitectl add api.example.com
 This automatically:
 1. Creates document root at `/var/www/api.example.com`
 2. Clones your repository into the document root
-3. Updates `/usr/local/bin/site-pull` with domain mapping (owner: `SITE_OWNER`)
-4. Enforces ownership `SITE_OWNER:www-data`, directories `2750`, files `0640`
+3. Enforces ownership `SITE_OWNER:www-data`, directories `2750`, files `0640`
 
 ### Deploy Updates
 
-After making changes to your repository:
+After pushing changes to your repository, pull them to the server:
 
 ```bash
+# Deploy latest commit on the default branch (main)
 sudo /usr/local/bin/site-pull api.example.com
+
+# Deploy a specific branch
+sudo /usr/local/bin/site-pull api.example.com staging
 ```
+
+site-pull reads `SITE_OWNER` from `/etc/sitectl/config` automatically, so no changes to the script are needed when adding new sites. After each pull it re-applies the same permissions as `sitectl add`: ownership `SITE_OWNER:www-data`, directories `2750`, files `0640`.
 
 ### Add Git to Existing Site
 
@@ -254,7 +260,7 @@ For sites created without Git integration:
 sudo sitectl add-git oldsite.example.com
 ```
 
-You will be prompted for the repository URL. If the site already has a `.git` directory, it will just register with site-pull without cloning.
+You will be prompted for the repository URL. If the site already has a `.git` directory, the clone step is skipped and permissions are enforced on the existing files.
 
 ### Skip Git Integration
 
@@ -272,31 +278,10 @@ For Git integration to work, you need:
    - Generate with: `ssh-keygen -t ed25519 -f /root/.ssh/github_account -C "deploy@yourserver"`
    - Add the public key to your GitHub repository: Settings -> Deploy keys -> Add deploy key
 
-2. **site-pull Script** - Located at `/usr/local/bin/site-pull`
-   - This script handles deployment and permission management
-   - sitectl automatically updates it with new domain mappings
-
-### site-pull Script Versioning
-
-sitectl automatically versions the `/usr/local/bin/site-pull` script to allow easy rollback if issues occur:
-
-- **Automatic Backup**: Before each modification (skipped if the domain already exists), a timestamped backup is created in `/var/backups/sitectl/site-pull/`
-- **Backup Format**: `site-pull.YYYYMMDD-HHMMSS-NNNNNNNNN` (e.g., `site-pull.20260130-143025-123456789`)
-- **Automatic Cleanup**: Last 10 backups are kept; older ones are automatically removed
-- **Automatic Rollback**: If an update fails, the previous version is automatically restored
-
-#### Manual Rollback
-
-If you need to manually restore a previous version:
-
-```bash
-# List available backups
-ls -lh /var/backups/sitectl/site-pull/
-
-# Restore from a specific backup
-sudo cp /var/backups/sitectl/site-pull/site-pull.20260130-143025-123456789 \
-     /usr/local/bin/site-pull
-```
+2. **site-pull Script** - Installed to `/usr/local/bin/site-pull` by `sudo sitectl install`
+   - Pulls the latest commit from GitHub, runs Composer if present, and re-applies permissions
+   - Reads `SITE_OWNER` from `/etc/sitectl/config` at runtime — no per-site edits needed
+   - To reinstall or update: run `sudo sitectl install` again (idempotent)
 
 ## Creating a Cloudflare API Token
 
@@ -321,7 +306,7 @@ sudo cp /var/backups/sitectl/site-pull/site-pull.20260130-143025-123456789 \
 |`/etc/apache2/sites-available/<domain>.conf`    |HTTP vhost config                   |
 |`/etc/apache2/sites-available/<domain>-ssl.conf`|HTTPS vhost config                  |
 |`/etc/letsencrypt/live/<domain>/`               |SSL certificates                    |
-|`/var/backups/sitectl/site-pull/`               |site-pull script backups (versioning)|
+|`/usr/local/bin/site-pull`                      |Deployment script (installed by `sitectl install`)|
 
 ## Troubleshooting
 
