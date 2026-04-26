@@ -396,15 +396,15 @@ if [[ ! -f "$SITECTL_CONFIG" ]]; then
 fi
 
 SITE_OWNER=""
-while IFS= read -r _line; do
-    _line="${_line%%#*}"
-    _line="${_line#"${_line%%[![:space:]]*}"}"
-    _line="${_line%"${_line##*[![:space:]]}"}"
-    if [[ "$_line" =~ ^SITE_OWNER=(.+)$ ]]; then
-        _val="${BASH_REMATCH[1]}"
-        _val="${_val#\'}" ; _val="${_val%\'}"
-        _val="${_val#\"}" ; _val="${_val%\"}"
-        SITE_OWNER="$_val"
+while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ "$line" =~ ^SITE_OWNER=(.+)$ ]]; then
+        val="${BASH_REMATCH[1]}"
+        val="${val#\'}" ; val="${val%\'}"
+        val="${val#\"}" ; val="${val%\"}"
+        SITE_OWNER="$val"
     fi
 done < "$SITECTL_CONFIG"
 
@@ -413,21 +413,19 @@ if [[ -z "$SITE_OWNER" ]]; then
     exit 1
 fi
 
-# 0) Ensure GitHub host key is trusted (idempotent)
 mkdir -p /root/.ssh
 touch /root/.ssh/known_hosts
+chmod 600 /root/.ssh/known_hosts
 ssh-keygen -F github.com >/dev/null || ssh-keyscan -H github.com >> /root/.ssh/known_hosts
 
-# 1) Use the root deploy key for Git
 export GIT_SSH_COMMAND="ssh -i /root/.ssh/github_account -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
-# 2) Sanity checks
 if [[ ! -d "$ROOT/.git" ]]; then
     echo "❌ $ROOT is not a git repo."
     exit 1
 fi
 
-# 3) Allow root to operate on this repo (Git safe.directory)
+# needed when repo owner (SITE_OWNER) differs from the invoking user (root)
 git config --global --add safe.directory "$ROOT" || true
 
 cd "$ROOT"
@@ -438,7 +436,6 @@ git fetch --all --prune
 echo "⏪ Resetting to origin/$BRANCH..."
 git reset --hard "origin/$BRANCH"
 
-# 4) Composer (optional): run if composer.json exists
 if [[ -f composer.json ]]; then
     echo "📦 Running composer (root allowed, no prompt)..."
     if command -v composer >/dev/null 2>&1; then
@@ -462,7 +459,7 @@ SITEPULL
     # Skip write if already identical
     if [[ -f "$SITE_PULL" ]] && \
        [[ "$(sha256sum "$SITE_PULL" 2>/dev/null | cut -d' ' -f1)" == \
-          "$(echo "$new_content" | sha256sum | cut -d' ' -f1)" ]]; then
+          "$(printf '%s\n' "$new_content" | sha256sum | cut -d' ' -f1)" ]]; then
         success "site-pull is already up to date"
         return 0
     fi
