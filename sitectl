@@ -18,7 +18,7 @@ VERSION="1.0.0"
 CONFIG_FILE="/etc/sitectl/config"
 STATE_DIR="/etc/sitectl/state"
 LOG_FILE="/var/log/sitectl.log"
-SITE_PULL_BACKUP_DIR="/var/backups/sitectl/site-pull"
+SITE_PULL="/usr/local/bin/site-pull"
 
 # Colors for output
 RED='\033[0;31m'
@@ -375,93 +375,104 @@ set_site_permissions() {
     return 0
 }
 
-# Update site-pull script with domain mapping
-update_site_pull() {
-    local domain="$1"
-    local site_pull="/usr/local/bin/site-pull"
-    
-    info "Updating site-pull script..."
-    
-    if [[ ! -f "$site_pull" ]]; then
-        error "site-pull script not found at ${site_pull}"
-        return 1
+# Install (or update) the site-pull deployment script
+install_site_pull() {
+    info "Installing site-pull script..."
+
+    local new_content
+    new_content=$(cat <<'SITEPULL'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${1:?Domain required (e.g. example.com)}"
+BRANCH="${2:-main}"
+ROOT="/var/www/$DOMAIN"
+
+# Load SITE_OWNER from sitectl config
+SITECTL_CONFIG="/etc/sitectl/config"
+if [[ ! -f "$SITECTL_CONFIG" ]]; then
+    echo "❌ sitectl config not found at $SITECTL_CONFIG. Run: sudo sitectl install"
+    exit 1
+fi
+
+SITE_OWNER=""
+while IFS= read -r _line; do
+    _line="${_line%%#*}"
+    _line="${_line#"${_line%%[![:space:]]*}"}"
+    _line="${_line%"${_line##*[![:space:]]}"}"
+    if [[ "$_line" =~ ^SITE_OWNER=(.+)$ ]]; then
+        _val="${BASH_REMATCH[1]}"
+        _val="${_val#\'}" ; _val="${_val%\'}"
+        _val="${_val#\"}" ; _val="${_val%\"}"
+        SITE_OWNER="$_val"
     fi
-    
-    # Check if domain already exists in site-pull
-    # Use more specific pattern to avoid matching commented lines
-    local domain_escaped="${domain//./\\.}"
-    if grep -q "^[[:space:]]*${domain_escaped})[[:space:]]*OWNER=" "$site_pull" 2>/dev/null; then
-        warn "Domain ${domain} already exists in site-pull, skipping update"
+done < "$SITECTL_CONFIG"
+
+if [[ -z "$SITE_OWNER" ]]; then
+    echo "❌ SITE_OWNER is not set in $SITECTL_CONFIG"
+    exit 1
+fi
+
+# 0) Ensure GitHub host key is trusted (idempotent)
+mkdir -p /root/.ssh
+touch /root/.ssh/known_hosts
+ssh-keygen -F github.com >/dev/null || ssh-keyscan -H github.com >> /root/.ssh/known_hosts
+
+# 1) Use the root deploy key for Git
+export GIT_SSH_COMMAND="ssh -i /root/.ssh/github_account -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+# 2) Sanity checks
+if [[ ! -d "$ROOT/.git" ]]; then
+    echo "❌ $ROOT is not a git repo."
+    exit 1
+fi
+
+# 3) Allow root to operate on this repo (Git safe.directory)
+git config --global --add safe.directory "$ROOT" || true
+
+cd "$ROOT"
+
+echo "🔄 Fetching latest from GitHub..."
+git fetch --all --prune
+
+echo "⏪ Resetting to origin/$BRANCH..."
+git reset --hard "origin/$BRANCH"
+
+# 4) Composer (optional): run if composer.json exists
+if [[ -f composer.json ]]; then
+    echo "📦 Running composer (root allowed, no prompt)..."
+    if command -v composer >/dev/null 2>&1; then
+        COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --prefer-dist -o || true
+    else
+        COMPOSER_ALLOW_SUPERUSER=1 php /usr/local/bin/composer install --no-dev --prefer-dist -o || true
+    fi
+fi
+
+echo "🔑 Fixing ownership..."
+chown -R "$SITE_OWNER:www-data" "$ROOT"
+
+echo "🔒 Enforcing Apache-readable perms (dirs 2750, files 0640)..."
+find "$ROOT" -type d -exec chmod 2750 {} \;
+find "$ROOT" -type f -exec chmod 0640 {} \;
+
+echo "✅ Deployment completed: $DOMAIN @ $BRANCH"
+SITEPULL
+)
+
+    # Skip write if already identical
+    if [[ -f "$SITE_PULL" ]] && \
+       [[ "$(sha256sum "$SITE_PULL" 2>/dev/null | cut -d' ' -f1)" == \
+          "$(echo "$new_content" | sha256sum | cut -d' ' -f1)" ]]; then
+        success "site-pull is already up to date"
         return 0
     fi
-    
-    # Create backup directory if it doesn't exist
-    if ! install -d -m 755 "$SITE_PULL_BACKUP_DIR" 2>/dev/null; then
-        warn "Could not create backup directory, continuing without backup"
-    fi
-    
-    # Create timestamped backup before making changes
-    # Use nanoseconds in timestamp to avoid collisions in rapid operations
-    local timestamp
-    timestamp=$(date +%Y%m%d-%H%M%S-%N)
-    local backup_file="${SITE_PULL_BACKUP_DIR}/site-pull.${timestamp}"
-    
-    # Attempt backup creation (simplified - just try the copy)
-    if cp -p "$site_pull" "$backup_file" 2>/dev/null; then
-        success "Created backup: ${backup_file}"
-    else
-        warn "Failed to create backup, continuing anyway"
-        backup_file=""  # Clear backup_file if backup failed
-    fi
-    
-    # Find the case statement and add new mapping before the default case
-    # Look for the line with the *) pattern (default case)
-    # Use portable [[:space:]] instead of \s
-    local line_num
-    line_num=$(grep -n '^[[:space:]]*\*)' "$site_pull" | head -1 | cut -d: -f1)
-    
-    if [[ -z "$line_num" ]]; then
-        error "Could not find default case in site-pull script"
-        # Restore from backup if it exists
-        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
-            warn "Restoring from backup..."
-            cp -p "$backup_file" "$site_pull"
-        else
-            warn "No backup available for rollback"
-        fi
+
+    printf '%s\n' "$new_content" > "$SITE_PULL" || {
+        error "Failed to write ${SITE_PULL}"
         return 1
-    fi
-    
-    # Insert the new mapping before the default case
-    local new_entry="  ${domain}) OWNER=\"${SITE_OWNER}\" ;;"
-    if ! sed -i "${line_num}i\\${new_entry}" "$site_pull"; then
-        error "Failed to update site-pull script"
-        # Restore from backup if it exists
-        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
-            warn "Restoring from backup..."
-            if cp -p "$backup_file" "$site_pull"; then
-                success "Successfully restored site-pull from backup"
-            else
-                error "Failed to restore from backup"
-            fi
-        else
-            warn "No backup available for rollback"
-        fi
-        return 1
-    fi
-    
-    # Cleanup old backups (keep last 10)
-    if [[ -d "$SITE_PULL_BACKUP_DIR" ]]; then
-        local backup_count
-        backup_count=$(find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f 2>/dev/null | wc -l)
-        if [[ $backup_count -gt 10 ]]; then
-            # Remove oldest backups, keep newest 10
-            find "$SITE_PULL_BACKUP_DIR" -name "site-pull.*" -type f -printf '%T+ %p\n' 2>/dev/null | \
-                sort | head -n -10 | cut -d' ' -f2- | xargs -r rm -f
-        fi
-    fi
-    
-    success "Added ${domain} -> ${SITE_OWNER} mapping to site-pull"
+    }
+    chmod 755 "$SITE_PULL"
+    success "Installed site-pull to ${SITE_PULL}"
     return 0
 }
 
@@ -845,7 +856,7 @@ cmd_add() {
         if [[ "$with_git" == "true" ]]; then
             echo "  • Would prompt for GitHub repository URL"
             echo "  • Would clone repository to ${docroot}"
-            echo "  • Would update /usr/local/bin/site-pull"
+            echo "  • Would deploy via /usr/local/bin/site-pull ${domain}"
         else
             echo "  • Git integration skipped (--without-git)"
         fi
@@ -973,9 +984,6 @@ cmd_add() {
                 rm -rf "$temp_clone" 2>/dev/null || true
                 fatal "Failed to clone repository"
             fi
-            
-            # Update site-pull script
-            update_site_pull "$domain" || warn "Failed to update site-pull, you may need to do this manually"
             
             # Set ownership and permissions
             set_site_permissions "$docroot" || fatal "Failed to set permissions"
@@ -1205,9 +1213,7 @@ cmd_add_git() {
     
     # Handle repository setup
     if [[ "$has_git" == "true" ]]; then
-        # Just register with site-pull, don't clone
-        info "Repository already exists, registering with site-pull..."
-        update_site_pull "$domain" || warn "Failed to update site-pull"
+        info "Repository already exists, skipping clone..."
     else
         # Need to clone - backup existing files first
         if [[ -n "$(ls -A "$docroot" 2>/dev/null)" ]]; then
@@ -1274,13 +1280,11 @@ cmd_add_git() {
             fatal "Failed to clone repository"
         fi
         
-        # Update site-pull
-        update_site_pull "$domain" || warn "Failed to update site-pull"
     fi
-    
+
     # Set ownership and permissions
     set_site_permissions "$docroot" || fatal "Failed to set permissions"
-    
+
     echo ""
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}${BOLD}  ✓ Git integration configured for: ${domain}${NC}"
@@ -1750,7 +1754,10 @@ systemctl reload apache2
 SH
     chmod +x "${hook_dir}/reload-apache.sh"
     success "Configured certbot renewal hook"
-    
+
+    # Install the site-pull deployment script
+    install_site_pull || warn "Could not install site-pull — run 'sudo sitectl install' again to retry"
+
     echo ""
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}${BOLD}  ✓ sitectl installed successfully!${NC}"
@@ -1819,11 +1826,11 @@ HELP
     echo ""
     echo -e "    ${CYAN}add-git${NC} <domain>"
     echo "        Add Git integration to an existing site."
-    echo "        Clones repository (or registers existing), updates site-pull script,"
-    echo "        and enforces SITE_OWNER:www-data ownership and permissions."
+    echo "        Clones repository (or uses existing) and enforces"
+    echo "        SITE_OWNER:www-data ownership and permissions."
     echo ""
     echo "        - Prompts for GitHub repo URL (SSH format)"
-    echo "        - If .git exists: registers with site-pull (no clone)"
+    echo "        - If .git exists: skips clone, sets permissions"
     echo "        - If no .git: clones repo (backs up existing files with confirmation)"
     echo ""
     echo "        Example:"
@@ -1848,7 +1855,7 @@ HELP
     echo ""
     echo -e "    ${CYAN}install${NC}"
     echo "        First-time setup: prompts for SITE_OWNER, installs dependencies,"
-    echo "        creates config, and sets up the sitectl command."
+    echo "        creates config, installs site-pull, and sets up the sitectl command."
     echo "        Preserves existing config on reinstall."
     echo ""
     echo -e "    ${CYAN}help${NC}"
@@ -1906,39 +1913,25 @@ HELP
     echo ""
     echo "    Requirements:"
     echo "      • SSH deploy key at /root/.ssh/github_account"
-    echo "      • site-pull script at /usr/local/bin/site-pull"
+    echo "      • site-pull script installed by: sudo sitectl install"
     echo ""
     echo "    When adding a site with Git:"
     echo "      • Prompts for GitHub repository URL (SSH format)"
     echo "      • Clones repository to /var/www/<domain>"
-    echo "      • Updates site-pull script with domain -> SITE_OWNER mapping"
     echo "      • Sets ownership SITE_OWNER:www-data, dirs 2750, files 0640"
     echo ""
     echo "    Deploy updates:"
     echo "      sudo /usr/local/bin/site-pull <domain>"
+    echo "      sudo /usr/local/bin/site-pull <domain> <branch>  # default: main"
+    echo ""
+    echo "    site-pull reads SITE_OWNER from /etc/sitectl/config automatically."
+    echo "    No script changes are needed when adding new sites."
     echo ""
     echo "    Skip Git integration:"
     echo "      sudo sitectl add domain.com --without-git"
     echo ""
     echo "    Add Git to existing site:"
     echo "      sudo sitectl add-git domain.com"
-    echo ""
-    echo -e "  ${BOLD}SITE-PULL SCRIPT VERSIONING${NC}"
-    echo ""
-    echo "    When sitectl updates /usr/local/bin/site-pull, it automatically"
-    echo "    creates timestamped backups in /var/backups/sitectl/site-pull/"
-    echo ""
-    echo "    • Backups are created before each modification (skipped if domain already exists)"
-    echo "    • Last 10 versions are kept automatically"
-    echo "    • Automatic rollback on update failure"
-    echo ""
-    echo "    Manual rollback:"
-    echo "      # List available backups"
-    echo "      ls -lh /var/backups/sitectl/site-pull/"
-    echo ""
-    echo "      # Restore from a specific backup"
-    echo "      sudo cp /var/backups/sitectl/site-pull/site-pull.YYYYMMDD-HHMMSS-NNNNNNNNN \\"
-    echo "           /usr/local/bin/site-pull"
     echo ""
     echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
     echo ""
@@ -1961,7 +1954,7 @@ HELP
     echo "    /etc/sitectl/state/                State files for resumable operations"
     echo "    /var/log/sitectl.log               Log file"
     echo "    /var/www/<domain>/                 Document roots"
-    echo "    /var/backups/sitectl/site-pull/    site-pull script backups"
+    echo "    /usr/local/bin/site-pull           Deployment script (installed by sitectl install)"
     echo ""
 }
 
