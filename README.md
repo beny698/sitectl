@@ -61,7 +61,7 @@ sudo nano /etc/sitectl/config
 
 ```bash
 # Site owner: Linux user that owns all site files (set during install)
-SITE_OWNER="ben"
+SITE_OWNER="yourusername"
 
 # Cloudflare API Token (Zone:Read, DNS:Edit permissions)
 CF_TOKEN="your_cloudflare_api_token_here"

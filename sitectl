@@ -143,7 +143,7 @@ require_site_owner() {
         fatal "SITE_OWNER not configured in $CONFIG_FILE. Run 'sudo sitectl install' to set the site owner."
     fi
     if ! id "$SITE_OWNER" &>/dev/null; then
-        fatal "SITE_OWNER user '${SITE_OWNER}' does not exist on this system. Create the user first: sudo useradd ${SITE_OWNER}"
+        fatal "SITE_OWNER user '${SITE_OWNER}' does not exist on this system. Create the user first: sudo useradd ${SITE_OWNER} -- then run 'sudo sitectl install' again."
     fi
 }
 
@@ -784,8 +784,7 @@ cmd_add() {
     
     check_root "add $domain"
     load_config
-    require_site_owner
-    
+
     # Acquire lock to prevent concurrent operations on the same domain
     acquire_lock "$domain"
     CURRENT_DOMAIN="$domain"
@@ -852,7 +851,7 @@ cmd_add() {
         fi
         echo ""
         echo "Permissions:"
-        echo "  • Owner: ${SITE_OWNER:-<SITE_OWNER not set>}:www-data"
+        echo "  • Owner: ${SITE_OWNER}:www-data"
         echo "  • Directories: 2750"
         echo "  • Files: 0640"
         echo ""
@@ -865,7 +864,9 @@ cmd_add() {
         echo ""
         exit 0
     fi
-    
+
+    require_site_owner
+
     # Check current state for resume capability
     local current_state
     current_state=$(get_state "$domain")
@@ -1693,6 +1694,15 @@ DNS_WAIT_SECONDS=180
 CONFIG
         chmod 600 "$CONFIG_FILE"
         success "Created config file: $CONFIG_FILE (SITE_OWNER=${site_owner_input})"
+
+        # Ensure SITE_OWNER is in the www-data group so they can access web-created files
+        if ! id -nG "$site_owner_input" | grep -qw www-data; then
+            usermod -aG www-data "$site_owner_input" && \
+                success "Added ${site_owner_input} to www-data group" || \
+                warn "Could not add ${site_owner_input} to www-data group — you may need to do this manually: sudo usermod -aG www-data ${site_owner_input}"
+        else
+            info "${site_owner_input} is already in the www-data group"
+        fi
     else
         info "Config file already exists: $CONFIG_FILE (preserved)"
     fi
