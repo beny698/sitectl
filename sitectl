@@ -1668,6 +1668,7 @@ cmd_install() {
     python3 -c "import certbot_dns_cloudflare" >/dev/null 2>&1 || packages_needed+=(python3-certbot-dns-cloudflare)
     command_exists curl || packages_needed+=(curl)
     command_exists jq || packages_needed+=(jq)
+    command_exists dig || packages_needed+=(dnsutils)
     
     if [[ ${#packages_needed[@]} -gt 0 ]]; then
         info "Installing: ${packages_needed[*]}"
