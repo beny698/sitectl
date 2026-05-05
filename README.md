@@ -69,7 +69,7 @@ CF_TOKEN="your_cloudflare_api_token_here"
 # Email for Let's Encrypt registration
 TLS_EMAIL="you@example.com"
 
-# Optional: DNS propagation wait time in seconds (default: 180)
+# Optional: max seconds to poll for DNS propagation before timing out (default: 180)
 DNS_WAIT_SECONDS=180
 
 # Optional: Server IP addresses (auto-detected if not set)
@@ -312,7 +312,7 @@ For Git integration to work, you need:
 
 ### SSL certificate fails
 
-**Wait longer for DNS propagation:**
+**DNS timed out before resolving — increase the timeout:**
 
 ```bash
 sudo sitectl add example.com --wait 300
@@ -366,7 +366,7 @@ sudo sitectl status example.com
 1. **DNS Setup**: Uses Cloudflare API to create/update A and AAAA records pointing to your server's public IPs (auto-detected). Enables Cloudflare proxy by default.
 1. **Document Root**: Creates `/var/www/<domain>/` with a placeholder index.html (non-git sites) or clones your repository (git sites).
 1. **Apache HTTP**: Creates and enables a virtual host on port 80 with HTTPS redirect.
-1. **DNS Propagation Wait**: Waits 3 minutes (configurable) for DNS to propagate.
+1. **DNS Propagation Wait**: Polls Cloudflare's resolver (`1.1.1.1`) every 5 seconds and proceeds as soon as the record is visible. `DNS_WAIT_SECONDS` (default 180) is the maximum wait before the script errors out, not a fixed delay.
 1. **SSL Certificate**: Uses certbot with DNS-01 challenge via Cloudflare to obtain a Let's Encrypt certificate. This method works even if HTTP isn't publicly accessible yet.
 1. **Apache HTTPS**: Creates and enables a virtual host on port 443 with security headers.
 1. **Permissions**: Recursively sets ownership to `SITE_OWNER:www-data`, directories to `2750`, and files to `0640`.

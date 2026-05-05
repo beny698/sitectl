@@ -290,6 +290,48 @@ get_ipv6() {
     fi
 }
 
+wait_for_dns() {
+    local domain="$1"
+    local max_wait="$2"
+    local poll_interval=5
+    local elapsed=0
+
+    local dns_tool=""
+    if command -v dig &>/dev/null; then
+        dns_tool="dig"
+    elif command -v host &>/dev/null; then
+        dns_tool="host"
+    elif command -v nslookup &>/dev/null; then
+        dns_tool="nslookup"
+    else
+        warn "No DNS lookup tool found (dig/host/nslookup). Falling back to fixed ${max_wait}s wait."
+        sleep "$max_wait"
+        return 0
+    fi
+
+    while [[ $elapsed -lt $max_wait ]]; do
+        local result=""
+        case "$dns_tool" in
+            dig)      result=$(dig @1.1.1.1 +short "$domain" A 2>/dev/null | head -1) ;;
+            host)     result=$(host -t A "$domain" 1.1.1.1 2>/dev/null | grep "has address" | head -1) ;;
+            nslookup) result=$(nslookup -type=A "$domain" 1.1.1.1 2>/dev/null | awk 'NR>3 && /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {print; exit}') ;;
+        esac
+
+        if [[ -n "$result" ]]; then
+            printf "\r  ✓ DNS resolved after %ds                              \n" "$elapsed"
+            return 0
+        fi
+
+        local remaining=$((max_wait - elapsed))
+        printf "\r  ⏳ Waiting for DNS... %3ds elapsed, %3ds remaining" "$elapsed" "$remaining"
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+    done
+
+    printf "\n"
+    return 1
+}
+
 # ==================== GIT INTEGRATION HELPERS ====================
 
 # Ensure GitHub host key is trusted
@@ -1055,18 +1097,12 @@ HTML
             # Wait for DNS propagation if we just set up DNS
             if [[ "$skip_dns" == "false" && "$current_state" != "ssl_started" ]]; then
                 echo ""
-                info "Waiting ${wait_time} seconds for DNS propagation..."
-                echo -e "  ${CYAN}(This ensures Cloudflare DNS is fully propagated before SSL verification)${NC}"
+                info "Polling for DNS propagation (timeout: ${wait_time}s)..."
+                echo -e "  ${CYAN}(Will proceed as soon as record is visible; timeout is ${wait_time}s)${NC}"
                 echo ""
-                
-                local elapsed=0
-                while [[ $elapsed -lt $wait_time ]]; do
-                    local remaining=$((wait_time - elapsed))
-                    printf "\r  ⏳ %3d seconds remaining... " "$remaining"
-                    sleep 10
-                    elapsed=$((elapsed + 10))
-                done
-                printf "\r  ✓ Wait complete.                    \n"
+                if ! wait_for_dns "$domain" "$wait_time"; then
+                    fatal "DNS record for ${domain} did not resolve within ${wait_time}s. Check Cloudflare or increase DNS_WAIT_SECONDS in ${CONFIG_FILE}."
+                fi
             fi
             
             save_state "$domain" "ssl_started"
@@ -1632,6 +1668,7 @@ cmd_install() {
     python3 -c "import certbot_dns_cloudflare" >/dev/null 2>&1 || packages_needed+=(python3-certbot-dns-cloudflare)
     command_exists curl || packages_needed+=(curl)
     command_exists jq || packages_needed+=(jq)
+    command_exists dig || packages_needed+=(dnsutils)
     
     if [[ ${#packages_needed[@]} -gt 0 ]]; then
         info "Installing: ${packages_needed[*]}"
@@ -1685,8 +1722,9 @@ CF_TOKEN="YOUR_CLOUDFLARE_API_TOKEN_HERE"
 # Email for Let's Encrypt registration and renewal notices
 TLS_EMAIL="your-email@example.com"
 
-# How long to wait for DNS propagation (seconds)
-# Default: 180 (3 minutes). Increase if SSL fails.
+# Maximum seconds to poll for DNS propagation before timing out.
+# The script checks actively and moves on as soon as the record resolves;
+# this value is only the upper bound before erroring out. Default: 180 (3 minutes).
 DNS_WAIT_SECONDS=180
 
 # Optional: Server IP addresses (auto-detected if not set)
